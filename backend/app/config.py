@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173"
     log_level: str = "INFO"
 
+    app_host: str = "127.0.0.1"
+    app_port: int = 8000
+    app_reload: bool = False
+
     def database_url(self, database_name: str | None = None) -> URL:
         """Builds the SQLAlchemy connection URL.
 
