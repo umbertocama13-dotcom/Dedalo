@@ -1,6 +1,10 @@
 # Environment
 venv/
 .venv/
+.env
+
+# Frontend dependencies
+node_modules/
 
 # Python cache / bytecode
 __pycache__/
