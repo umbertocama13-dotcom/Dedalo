@@ -5,7 +5,7 @@ from typing import Literal
 
 from rapidfuzz import fuzz
 
-from app.services.matching.text_normalizer import normalize_text
+from app.utils.normalize_text_ita import normalize_text_ita
 
 
 @dataclass(frozen=True)
@@ -91,7 +91,7 @@ class FuzzyMatcher(Matcher):
             Results ordered by score (highest first), ties broken by diagnostic id
             so the order is always reproducible. Empty if nothing reaches the threshold.
         """
-        normalized_query = normalize_text(query)
+        normalized_query = normalize_text_ita(query)
         if not normalized_query:
             return []
 
@@ -102,7 +102,7 @@ class FuzzyMatcher(Matcher):
             # when the query shares only a subset of words with the symptom (e.g. "nastro"
             # alone, or same component with a different symptom). Scorer comparison on the
             # seed phrases is documented in workflow_sviluppo.md.
-            score = fuzz.token_sort_ratio(normalized_query, normalize_text(candidate.symptom_description))
+            score = fuzz.token_sort_ratio(normalized_query, normalize_text_ita(candidate.symptom_description))
             if score >= self.threshold:
                 results.append(_build_result(candidate, score))
 

@@ -2,9 +2,9 @@ import re
 import unicodedata
 
 # Articles, simple and articulated prepositions, conjunctions and clitics that carry
-# no diagnostic meaning. Elided forms ("dell'", "l'") appear without the apostrophe
+# no meaning for matching. Elided forms ("dell'", "l'") appear without the apostrophe
 # because punctuation is replaced by spaces before filtering.
-# "non" is deliberately NOT a stopword: it reverses the meaning of a symptom.
+# "non" is deliberately NOT a stopword: it reverses the meaning of a sentence.
 ITALIAN_STOPWORDS: frozenset[str] = frozenset(
     {
         "il", "lo", "la", "i", "gli", "le", "l", "un", "uno", "una",
@@ -21,14 +21,18 @@ ITALIAN_STOPWORDS: frozenset[str] = frozenset(
 _NON_WORD_CHARS = re.compile(r"[^\w\s]")
 
 
-def normalize_text(text: str) -> str:
-    """Normalizes free text so that superficial differences do not affect matching.
+def normalize_text_ita(text: str) -> str:
+    """Normalizes Italian free text so that superficial differences do not affect comparisons.
 
     Steps: lowercase, accent removal, punctuation and symbols replaced by spaces,
     Italian stopwords removed, whitespace collapsed.
 
+    Example:
+        >>> normalize_text_ita("Il nastro si ferma, dell'aria è insufficiente!")
+        'nastro ferma aria insufficiente'
+
     Args:
-        text: Raw text, e.g. a symptom typed by an operator.
+        text: Raw Italian text, e.g. a sentence typed by a user.
 
     Returns:
         The normalized text; an empty string if no meaningful word remains.
