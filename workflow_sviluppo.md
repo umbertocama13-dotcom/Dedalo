@@ -1,354 +1,425 @@
 # Dedalo — Workflow di sviluppo
 
-Questo documento raccoglie **perché** il PoC è fatto così: le decisioni di design, le alternative scartate, i tentativi che non hanno funzionato, i limiti conosciuti e i prossimi passi.
+Questo documento raccoglie **perché** il PoC è fatto così: decisioni di design, alternative scartate, tentativi che non hanno funzionato, limiti conosciuti e prossimi passi.
 
 Per installazione, avvio e uso vedi il [README.md](README.md).
 
-Stato al 14/09/2026: PoC v1 completo. Backend testato (copertura ~99%), frontend verificato con build, lint e prove manuali.
+Stato al 15/09/2026: **v2 completa**. Backend testato (338 test, copertura 99%), frontend verificato con build, lint e smoke test HTTP sul backend reale con il modello vero. La modalità LLM è testata solo con provider simulati: non è ancora stata provata con una chiave OpenAI reale.
 
 ---
 
 ## Indice
 
-1. [Obiettivo e vincoli del brief](#1-obiettivo-e-vincoli-del-brief)
-2. [Architettura](#2-architettura)
-3. [Ordine di sviluppo](#3-ordine-di-sviluppo)
-4. [Decisioni di design e alternative scartate](#4-decisioni-di-design-e-alternative-scartate)
-5. [Tentativi che non hanno funzionato](#5-tentativi-che-non-hanno-funzionato)
-6. [Limiti conosciuti](#limiti-conosciuti)
-7. [Prossimi passi pianificati](#prossimi-passi-pianificati)
-8. [Migliorie possibili (non pianificate)](#migliorie-possibili-non-pianificate)
+- [Parte 1 — v2: ricerca semantica, conversazione, interfaccia esperto, CSV](#parte-1--v2)
+  1. [Perché la v2](#1-perché-la-v2)
+  2. [Architettura v2](#2-architettura-v2)
+  3. [Modello dati](#3-modello-dati)
+  4. [Ricerca semantica e calibrazione](#4-ricerca-semantica-e-calibrazione)
+  5. [Conversazione, probabilità e domande](#5-conversazione-probabilità-e-domande)
+  6. [Assistente LLM facoltativo](#6-assistente-llm-facoltativo)
+  7. [Interfaccia esperto e CSV](#7-interfaccia-esperto-e-csv)
+  8. [Test](#8-test)
+  9. [Tentativi che non hanno funzionato (v2)](#9-tentativi-che-non-hanno-funzionato-v2)
+  10. [Limiti conosciuti](#10-limiti-conosciuti)
+  11. [Migliorie possibili](#11-migliorie-possibili)
+- [Parte 2 — v1: decisioni ancora valide e storia](#parte-2--v1)
 
 ---
 
-## 1. Obiettivo e vincoli del brief
+# Parte 1 — v2
 
-Dedalo aiuta operatori e manutentori a diagnosticare guasti partendo dalla conoscenza reale della fabbrica, contestualizzata per **famiglia di prodotto** e **fase del ciclo**. L'obiettivo è ridurre i tempi di diagnosi e riparazione (MTTD/MTTR) e la dipendenza dai tecnici specializzati.
+## 1. Perché la v2
 
-Vincoli che hanno guidato ogni scelta:
+Provando la v1 è emerso il limite decisivo: **non faceva quello per cui era pensata**. Il matching `token_sort_ratio` con soglia 80 trovava una diagnosi solo se l'operatore scriveva una frase quasi identica al sintomo registrato. Doveva quindi conoscere a memoria la colonna dei sintomi.
 
-| Vincolo | Come è stato rispettato |
-|---|---|
-| **Offline-first**: niente dipendenze da servizi cloud | tutto gira in locale; l'AI è spenta di default e l'unico backend esterno (`api`) è opzionale e documentato come adatto solo alla validazione |
-| **Determinismo prima dell'NLP** | matching a regole con rapidfuzz; l'AI non produce mai una diagnosi |
-| **RBAC** `expert` / `operator` | controllo del ruolo sul server a ogni richiesta, con test su ogni endpoint di scrittura |
-| **Fallback anti-allucinazione** | sotto la soglia di somiglianza la risposta è `no_match` con un messaggio fisso |
-| **Provider AI intercambiabile** con una sola variabile in `.env` | interfaccia `AIProvider` più factory; il resto dell'app non conosce l'implementazione concreta |
+Misurato sulle stesse 60 frasi da operatore usate per calibrare la v2 (sezione 4):
 
-## 2. Architettura
+| | diagnosi giusta tra le prime 5 | frasi fuori tema respinte | negazioni gestite |
+|---|---|---|---|
+| **v1** (fuzzy, soglia 0,80) | **3 / 48** | 9 / 9 | 0 / 3 |
+| **v2** (modello italiano + fuzzy) | **47 / 48** | nessuna mostrata come sicura; 3 / 9 senza ipotesi, 6 / 9 come incerte | 3 / 3 |
+
+Richieste di `update.md`, tutte implementate:
+
+1. ricerca per significato (vector search);
+2. chat guidata, con LLM **attivabile e disattivabile**: l'app deve restare utile anche offline e senza costi;
+3. mai una risposta univoca, ma **una lista di possibilità con la probabilità**;
+4. interfaccia per l'esperto (inserimento, consultazione, modifica);
+5. revisione delle tabelle (unificazione, eccezioni, utilità delle fasi);
+6. import/export CSV, con una spiegazione per l'esperto su come compilare il file.
+
+## 2. Architettura v2
 
 ```
 Browser (React)
-   │  fetch + Bearer token
+   │  fetch + Bearer token, conversazione inviata per intero a ogni turno
    ▼
-routes/          ← riceve e valida la richiesta, controlla il ruolo (dependencies.py)
+routes/            ← validazione, ruolo (dependencies.py)
    │
-services/        ← logica di business
-   │   ├── matching/     motore deterministico (funzione pura, senza database)
-   │   └── ai/           AIProvider: none | api | local
+services/
+   │   diagnosis_service      orchestrazione del turno
+   │   ├── matching/          SemanticMatcher (embedding + fuzzy + regola negazione)
+   │   │     └── embeddings/  Embedder locale + cache per testo
+   │   ├── probability_service    percentuali con quota "nessuna di queste"
+   │   ├── disambiguation_service domanda di scelta deterministica
+   │   └── llm_advisor_service    passo LLM facoltativo, risposta validata
+   │   knowledge_base_service / csv_service / import_service
    ▼
-repositories/    ← SQL esplicito (SQLAlchemy Core)
+repositories/      ← SQL esplicito
    │
 MySQL
 ```
 
-La dipendenza va sempre in un solo verso, dall'alto verso il basso: una route non chiama mai un repository direttamente, e un service non sa nulla di HTTP, tranne sollevare `HTTPException`.
+### Cosa è deterministico e cosa no
 
-### Flusso di una richiesta di diagnosi
+| Parte | Deterministica? |
+|---|---|
+| Candidati (contesto SQL, embedding, fuzzy, negazione, soglie) | ✅ a parità di modello e dati |
+| Componente, causa, soluzione mostrati | ✅ sempre letti dal DB, mai generati |
+| Ordine e probabilità delle ipotesi | ✅ calcolati dai punteggi, anche in modalità LLM |
+| Domande di scelta offline | ✅ costruite dai dati |
+| Domande in modalità LLM | ❌ generate, ma possono solo restringere i candidati |
+| Scelta di quali ipotesi tenere in modalità LLM | ❌ proposta dal modello, validata dal server |
 
-1. `POST /diagnosis` riceve sintomo, famiglia e fase. Pydantic li valida: toglie gli spazi, rifiuta i testi vuoti o più lunghi di 500 caratteri e gli ID non positivi.
-2. `get_current_user` verifica il token e **rilegge il ruolo dal database**.
-3. `catalog_service.validate_family_phase` verifica il contesto: famiglia o fase inesistente → `404`, fase di un'altra famiglia → `400`.
-4. `diagnostics_repository.list_match_candidates` carica **tutte** le diagnosi generiche, ciascuna con l'eventuale eccezione per quella famiglia e quella fase, in un'unica query con `LEFT JOIN`.
-5. `FuzzyMatcher` confronta il testo dell'operatore con ogni sintomo e tiene quelli con punteggio ≥ soglia. Dove c'è un'eccezione, sostituisce causa e soluzione generiche con quelle specifiche.
-6. Se il testo originale non trova nulla, l'`AIProvider` riscrive il sintomo e il matching viene ripetuto sul testo riscritto. Con `none` il testo resta identico e il secondo tentativo non parte.
-7. La risposta ha `status: "match"`, con le ipotesi ordinate, oppure `status: "no_match"`, con il messaggio fisso.
+### Flusso di un turno (`POST /diagnosis`)
 
-## 3. Ordine di sviluppo
+1. Pydantic valida contesto, messaggi (massimo 20 da 1000 caratteri, almeno uno dell'operatore) e id esclusi.
+2. `validate_family_phase`: famiglia inesistente → `404`; fase senza famiglia o di un'altra famiglia → `400`.
+3. `list_candidates` carica le diagnosi applicabili: generiche, della famiglia e, se la fase è indicata, solo di quella fase. Senza fase entrano tutte quelle della famiglia. Gli id esclusi vengono tolti.
+4. Ogni messaggio dell'operatore passa dal matcher; per ogni diagnosi si tiene il punteggio migliore (sezione 5).
+5. Nessun candidato sopra `SEMANTIC_RECALL_THRESHOLD` → `no_match`.
+6. Senza AI: ipotesi con probabilità ed eventuale domanda di scelta. Con AI: il modello decide tra domanda, restringimento o `no_match`; se la risposta non è valida si torna al punto precedente con `ai_fallback: true`.
 
-Bottom-up, dal livello più isolato a quello più assemblato, con una branch `feature/*` per ogni step.
+## 3. Modello dati
 
-| Step | Contenuto | Branch |
+### Una tabella `diagnostics` al posto di `base_diagnostics` + `diagnostic_exceptions`
+
+**Il dubbio di `update.md`**: le tabelle erano separate per le prestazioni? **No.** Il motivo era la normalizzazione, e con qualche migliaio di righe una JOIN costa pochi millisecondi. Si è quindi unito ciò che non aveva motivo di stare separato.
+
+```sql
+diagnostics (id, symptom_description, affected_component, probable_cause, recommended_solution,
+             family_id NULL, cycle_phase_id NULL, created_by, created_at, updated_at)
+```
+
+| `family_id` | `cycle_phase_id` | Ambito |
 |---|---|---|
-| 0 | `.gitignore` (`.env`, `node_modules/`), venv, `.env.example` | `feature/project-setup` |
-| 1 | `schema.sql`, `seed.sql` | `feature/database` |
-| 2 | config, engine del database, logging | `feature/backend-core` |
-| 3 | repository | `feature/repositories` |
-| 4 | motore di matching (TDD) | `feature/matching-engine` |
-| 5 | hashing delle password, JWT, `auth_service` (TDD); spostamento del normalizzatore in `utils/` | `feature/auth` |
-| 6 | `AIProvider` e i backend `none`/`api`/`local` (TDD) | `feature/ai-provider` |
-| 7 | schemas, `catalog_service`, `diagnosis_service`, `knowledge_base_service` (TDD) | `feature/services` |
-| 8 | route, dipendenze, `create_app()`, `run.py` | `feature/api-routes` |
-| 9 | test delle API e dei permessi | `feature/api-tests` |
-| 10 | frontend React | `feature/frontend` |
-| 11 | documentazione | `feature/docs` |
+| NULL | NULL | tutte le famiglie |
+| valorizzato | NULL | tutta la famiglia |
+| valorizzato | valorizzato | solo quella fase |
 
-Il TDD è stato usato dove il comportamento era ben definito: matching, autenticazione, provider AI e service. Per ognuno i test sono stati visti fallire prima di scrivere il codice. Le route (step 8) sono state verificate prima a mano con `curl` e poi coperte dai test dello step 9.
+- **Eliminate le eccezioni.** Una "procedura specifica per fase" è ora una riga normale con la fase valorizzata. In chat compare accanto alle generiche, con il suo badge, e a parità di punteggio viene prima (sezione 5). Motore, API, CSV e interfaccia hanno un concetto in meno.
+- **Restano separate `product_families`, `cycle_phases` e `users`.** Alimentano i menu, un nome si corregge in un solo punto, e la FK impedisce che "Cella saldatura" e "Cella di saldatura" diventino due famiglie. È esattamente l'errore che l'import CSV intercetta.
+- **FK composita** `(cycle_phase_id, family_id) → cycle_phases (id, family_id)`, come in v1. MySQL non la controlla se una delle colonne è NULL, ed è ciò che permette le righe "tutta la famiglia".
+- **`CHECK (cycle_phase_id IS NULL OR family_id IS NOT NULL)`**: una fase senza famiglia non ha senso. Richiede MySQL 8.0.16+ (verificato su 8.0.46).
+- **FK di contesto con `RESTRICT`, non `CASCADE`**: MySQL vieta azioni referenziali sulle colonne usate in un `CHECK` (errore 3823).
+- **Rimosso l'indice FULLTEXT**: in v1 non era usato, e la ricerca semantica ne prende il posto anche come futuro pre-filtro.
+- Verificato sul database reale: la fase senza famiglia viene rifiutata (3819), la fase di un'altra famiglia (1452), la famiglia inesistente (1452).
 
-## 4. Decisioni di design e alternative scartate
+*Scartato: tabella `symptoms` separata con le diagnosi collegate.* Il testo del sintomo sarebbe salvato una volta sola, ma l'import CSV dovrebbe riconoscere i sintomi esistenti e anche l'interfaccia diventerebbe più complessa. Con una riga per diagnosi il CSV corrisponde 1:1 a una riga di Excel. La ripetizione del testo non pesa: la cache degli embedding lavora per testo, quindi un sintomo ripetuto viene calcolato una volta sola.
 
-### 4.1 Database
+### Le fasi: facoltative, non eliminate
 
-**MySQL 8 invece di MariaDB.** Il brief ammette entrambi. MySQL 8 era già installato e attivo, e supporta tutto quello che serve: FK composite, FULLTEXT su InnoDB, `ENUM`. Installare MariaDB non avrebbe portato vantaggi.
+L'esempio di `update.md`: la cella di saldatura non completa il ciclo, ma il guasto è sul nastro pallet. La fase in cui l'allarme appare non dice dove sta il guasto. D'altra parte alcune procedure valgono davvero solo in una fase (per esempio dopo un cambio formato).
 
-**Coerenza famiglia ↔ fase con una FK composita invece di un trigger.**
-`cycle_phases` ha `UNIQUE (id, family_id)`, e `diagnostic_exceptions` ha `FOREIGN KEY (cycle_phase_id, family_id) REFERENCES cycle_phases (id, family_id)`. Il database rifiuta così un'eccezione che associa una fase a una famiglia a cui non appartiene.
-- *Scartato: trigger `BEFORE INSERT/UPDATE` con `SIGNAL`.* Funzionerebbe, ma è logica nascosta, più difficile da leggere e da testare, e va scritta due volte (insert e update). La FK composita è dichiarativa e si vede con `SHOW CREATE TABLE`.
-- Il vincolo `UNIQUE (id, family_id)` sembra ridondante, perché `id` è già unico. Serve solo come destinazione della FK composita, ed è commentato nello schema.
+- **L'operatore** può non indicare la fase ("*Non so / tutte le fasi*"): entrano tutte le diagnosi della famiglia.
+- **L'esperto** scrive una diagnosi a livello di famiglia quando il sintomo riguarda tutta la cella, come nel seed (id 26-28), e a livello di fase solo quando serve.
+- Con la fase indicata restano esclusi solo i sintomi scritti per altre fasi.
 
-**Altri vincoli:**
-- `UNIQUE (family_id, phase_number)`: nessuna famiglia ha due "fase 3".
-- `UNIQUE (base_diagnostic_id, cycle_phase_id)`: al massimo un'eccezione per diagnosi in ogni fase. Garantisce anche che il `LEFT JOIN` del matching non duplichi le righe.
-- Nessun `UNIQUE` su `symptom_description`: lo stesso sintomo può avere più cause alternative, come richiesto dal brief.
-- `ON DELETE CASCADE` solo da `base_diagnostics` verso le sue eccezioni, perché un'eccezione non ha senso senza la diagnosi. Tutte le altre FK sono `RESTRICT`: non si cancella per sbaglio una famiglia o un utente che ha scritto dati.
+*Scartato: eliminare le fasi.* Più semplice, ma si perderebbe la procedura specifica per fase.
+*Scartato: fasi obbligatorie come in v1.* Resterebbe il limite dell'esempio.
 
-**Le eccezioni sostituiscono sempre sia la causa sia la soluzione** (`NOT NULL`).
-- *Alternativa:* colonne nullable, con ripiego sul valore generico. Più flessibile, ma aggiunge casi al motore. Si può introdurre in seguito rendendo le colonne `NULL`, senza cambiare la struttura delle tabelle.
+### Seed
 
-**L'indice FULLTEXT c'è ma non viene usato.** Il brief lo richiede, ed è pronto come pre-filtro per quando la knowledge base sarà grande (vedi 4.3 e i limiti).
+3 famiglie, tra cui una **cella di saldatura robotizzata** con nastro pallet, e 36 diagnosi: 10 generiche, 16 per famiglia, 10 per fase. Coprono sintomo ripetuto con cause diverse, il caso del fermo cella, coppie di sintomi opposti per la negazione, sintomi simili su componenti diversi.
 
-**Seed con ID espliciti**, così i test possono riferirsi a righe precise.
+## 4. Ricerca semantica e calibrazione
 
-### 4.2 Accesso al database
+### sentence-transformers direttamente, senza LlamaIndex
 
-**SQLAlchemy Core** con query `text()` e parametri `:nome`.
-- *Scartato: SQLAlchemy ORM.* Avrebbe creato una seconda definizione dello schema (classi Python) da tenere allineata a mano con `schema.sql`.
-- *Scartato: solo PyMySQL.* Connessioni, pool e transazioni andrebbero gestiti a mano, con molto codice ripetuto.
+- Le righe sono frasi corte: nessun chunking, nessun loader, nessuna persistenza su disco. LlamaIndex avrebbe portato molte dipendenze per una funzione di due righe (embedding e prodotto scalare).
+- Nell'esempio di `update.md`, `as_query_engine().query()` avrebbe anche **chiamato un LLM** per sintetizzare una risposta, e con le impostazioni di default usa OpenAI sia per gli embedding sia per il testo. È l'opposto del requisito "cause e soluzioni solo dal DB".
+- Il nuovo matcher implementa l'interfaccia `Matcher` già prevista in v1: route e repository non sono cambiati per questo.
 
-Dettagli non ovvi:
-- **`pool_pre_ping` + `pool_recycle=3600`**: MySQL chiude le connessioni inattive dopo `wait_timeout` (8 ore). Senza queste opzioni, la prima richiesta dopo una notte fallirebbe.
-- **Una transazione per richiesta** (`get_connection`): commit se tutto va bene, rollback se c'è un errore.
-- **`rowcount` degli update**: MySQL conta di default le righe *modificate*, quindi un update con valori identici darebbe 0 e sembrerebbe un 404. Il dialetto PyMySQL di SQLAlchemy attiva invece il conteggio delle righe *trovate*. È stato verificato.
-- **Pacchetto `cryptography`**: MySQL 8 usa l'autenticazione `caching_sha2_password`, e senza questo pacchetto PyMySQL può fallire il login in modo intermittente.
+### Cache per testo invece di un indice vettoriale
 
-### 4.3 Motore di matching
+`EmbeddingCache` ricorda il vettore di ogni testo già visto. A ogni richiesta i candidati si leggono dal DB e si calcolano solo i testi nuovi; all'avvio parte un *warm-up* su tutti i sintomi.
 
-**rapidfuzz in Python invece del FULLTEXT di MySQL come motore.**
-Misurato sui dati del seed: la ricerca FULLTEXT `nastro trasportatore` trova 2 righe, mentre `nastor trasportatre` (con refusi) ne trova **0**. Il FULLTEXT lavora a parole intere, ha stopword inglesi e ignora le parole sotto i 3 caratteri. Scrivere il matcher come funzione pura (candidati in ingresso, risultati in uscita) permette anche di testarlo senza database.
+- Il **DB resta l'unica fonte di verità**: dopo una modifica o un import non c'è nessun indice da aggiornare, e la modifica è visibile subito.
+- *Scartato: FAISS / Chroma / indice persistente.* Andrebbe sincronizzato a ogni scrittura, con un guadagno nullo a questi volumi.
+- Thread-safe (`threading.Lock`), perché FastAPI esegue le route sincrone in un pool di thread. Il calcolo avviene fuori dal lock, così una richiesta lenta non blocca le altre.
 
-**Normalizzazione (`normalize_text_ita`):**
-1. tutto in minuscolo;
-2. accenti rimossi con la scomposizione Unicode NFKD;
-3. punteggiatura e simboli sostituiti da spazi;
-4. stopword italiane rimosse.
+### Scelta del modello: misurata, non stimata
 
-**"non" non è una stopword**, perché inverte il senso del sintomo. Vedi però il limite sulla negazione.
+`tests/fixtures/operator_queries.json` contiene 60 frasi scritte come un operatore: sinonimi, frasi corte, refusi, gergo, negazioni, frasi fuori tema, sintomi di un'altra famiglia. 48 devono trovare una diagnosi, 9 no, 3 sono negazioni. Lo script `scripts/evaluate_matching.py` le misura.
 
-**Scorer: `token_sort_ratio`, soglia 80.** Il piano iniziale prevedeva `token_set_ratio`. Prima di scrivere i test sono stati misurati quattro scorer sulle frasi del seed già normalizzate:
+Primo confronto, tra soglia assoluta e criterio relativo (primo punteggio meno media o mediana dei candidati), accuratezza bilanciata tra "diagnosi trovata tra le prime 5" e "frase fuori tema respinta":
 
-| Caso | `token_set_ratio` | `token_sort_ratio` | `ratio` | `WRatio` |
+| Modello | Dimensione | Soglia assoluta | Relativo (miglior criterio) | Note |
 |---|---|---|---|---|
-| OK: testo esatto | 100 | 100 | 100 | 100 |
-| OK: refusi | 97.4 | 97.4 | 97.4 | 97.4 |
-| OK: parole in ordine diverso | 100 | 100 | **50** | 95 |
-| OK: frase più lunga ("linea 3") | 100 | 90.9 | 90.9 | 95 |
-| OK?: descrizione parziale ("pinza non chiude") | 100 | **61.5** | 61.5 | 85.5 |
-| NO: stesso componente, sintomo diverso ("nastro trasportatore rumoroso") | **81.6** | 58 | 69.6 | 77.6 |
-| NO: una parola sola ("nastro") | **100** | 26.1 | 26.1 | **90** |
-| NO: "film strappato" contro "saldatura film irregolare grinze" | 44.4 | 39.1 | 30.4 | **85.5** |
-| NO: sintomo non correlato | 40.7 | 40.7 | 37 | 51.4 |
+| paraphrase-multilingual-MiniLM-L12-v2 | 470 MB | 80% (+fuzzy 84%) | 82-88% | ranking discreto, punteggi alti anche per frasi fuori tema ("muletto" 0,67) |
+| paraphrase-multilingual-mpnet-base-v2 | 1,1 GB | 77% (+fuzzy 81%) | 83-86% | peggiore del previsto sul primo risultato |
+| intfloat/multilingual-e5-base | 1,1 GB | 82% | 87-89% | **ranking migliore** (100% tra i primi 5), ma punteggi compressi 0,79-0,95: nessuna soglia assoluta separa le frasi fuori tema |
+| **nickprock/sentence-bert-base-italian-xxl-uncased** | 440 MB | **90% (+fuzzy 91%)** | 91-92% | **unico con il 100% di frasi fuori tema respinte** a soglia assoluta; licenza MIT |
 
-- `token_set_ratio` è stato **scartato**: dà un punteggio alto quando le parole della richiesta sono un sottoinsieme di quelle del sintomo, e quindi produrrebbe diagnosi sbagliate con una parola sola o con un sintomo diverso sullo stesso componente.
-- `WRatio` è stato scartato per lo stesso motivo; `ratio` perché non regge le parole in ordine diverso.
-- `token_sort_ratio` separa bene i casi: tutti quelli corretti stanno a 90.9 o più, tutti quelli sbagliati a 58 o meno. Il prezzo è che una descrizione molto parziale non trova nulla. È una scelta voluta: per il brief "nessun dato" è sempre meglio di una diagnosi sbagliata.
+**Scelto il modello italiano con il fuzzy.** Separa meglio, è leggero (55-60 ms a richiesta su CPU) e permette una soglia assoluta. È addestrato solo sull'italiano, e questo è un limite (sezione 10).
 
-**Ordinamento stabile:** per punteggio decrescente, poi per ID della diagnosi, così a parità di input l'ordine è sempre lo stesso.
+**Criteri relativi scartati.** Guadagnano solo un punto e dipendono da quali e quante righe ci sono nel contesto: aggiungere diagnosi cambierebbe l'esito per le stesse frasi.
 
-**Interfaccia `Matcher`**: `diagnosis_service` dipende dall'interfaccia, non da `FuzzyMatcher`. Un futuro `SemanticMatcher` (ad esempio con sentence-transformers in locale) si aggiunge senza toccare route e repository.
+### Soglie finali (output di `scripts/evaluate_matching.py`)
 
-**Carico di tutte le diagnosi a ogni richiesta.** Con centinaia o poche migliaia di righe è istantaneo e semplice. Per volumi maggiori vedi i limiti.
+Modello italiano con fuzzy, soglia per soglia:
 
-### 4.4 Fallback anti-allucinazione
+| soglia | trovata tra le prime 5 | trovata per prima | fuori tema senza ipotesi | negazione |
+|---|---|---|---|---|
+| 0,45 | 48/48 | 41/48 | 0/9 | 3/3 |
+| **0,50** | **47/48** | **40/48** | 3/9 | 3/3 |
+| 0,55 | 44/48 | 40/48 | 5/9 | 3/3 |
+| 0,60 | 40/48 | 36/48 | 8/9 | 3/3 |
+| **0,65** | 39/48 | 35/48 | **9/9** | 3/3 |
+| 0,70 | 31/48 | 27/48 | 9/9 | 3/3 |
 
-- `no_match` è una risposta **`200`**, non un errore: è un esito previsto.
-- Il messaggio è fisso nel backend e il frontend mostra un riquadro dedicato. Nessun testo viene generato.
-- Il frontend (`DiagnosisResult`) sceglie cosa mostrare in base a `status`. Uno stato sconosciuto **non viene mai mostrato come diagnosi**: compare "Risposta non riconosciuta".
+Una soglia sola avrebbe obbligato a scegliere tra perdere diagnosi giuste (0,65) e mostrare ipotesi per frasi fuori tema (0,50). Da qui le **tre fasce**:
 
-### 4.5 Provider AI
+- sotto **0,50** (`SEMANTIC_RECALL_THRESHOLD`) → nessun dato;
+- tra 0,50 e **0,65** (`SEMANTIC_MATCH_THRESHOLD`) → ipotesi **incerte**, con avviso e domanda di scelta;
+- da 0,65 → ipotesi.
 
-**Spento di default** (`AI_PROVIDER=none`): il PoC funziona e si testa senza costi e senza far uscire dati dalla macchina.
+| Frasi | sicure | incerte | nessun dato |
+|---|---|---|---|
+| da trovare (48) | 39 | 8 | 1 |
+| fuori tema (9) | **0** | 6 | 3 |
 
-**L'AI interviene solo se il testo originale non trova nulla.**
-- *Scartato: passare sempre dall'AI prima del matching.* Una riscrittura del modello potrebbe trasformare un sintomo che il matching avrebbe trovato correttamente in uno sbagliato. Manderebbe inoltre fuori dalla macchina anche testi che non ne avevano bisogno, con costi e latenza per ogni richiesta.
-- La risposta indica `matched_on: "original" | "ai_normalized"`. Nel secondo caso il frontend mostra "Sintomo interpretato come: …", così l'operatore vede su quale testo è avvenuto il match.
-- Se il provider fallisce, l'errore viene intercettato: avviso nel log e risposta deterministica comunque. Un Ollama spento non blocca la diagnosi.
+Nessuna frase fuori tema viene mai presentata come sicura. Quelle che finiscono tra le incerte hanno anche quasi tutta la probabilità assegnata a "nessuna di queste" (sezione 5).
 
-**Formato OpenAI-compatibile per `ApiAIProvider`.**
-- *Scartato: API nativa Anthropic.* È valida se la chiave di test è Anthropic, ma il formato `/v1/chat/completions` è quello accettato anche dai server che un'azienda usa per ospitare modelli in casa (vLLM, LM Studio, Ollama stesso). Lo stesso client può quindi puntare a un server interno cambiando solo `AI_API_URL`.
+### Fuzzy insieme agli embedding
 
-**httpx diretto, senza SDK dei vendor**: un solo client HTTP per entrambi i backend, nessuna dipendenza da un fornitore specifico.
+Punteggio = massimo tra similarità del coseno e `token_sort_ratio / 100`. Gli embedding reggono male i refusi ("nastor trasportatre"), il fuzzy li regge bene. Con il modello scelto il fuzzy porta "trovata tra le prime 5" da 46 a 47 su 48 a parità di soglia, senza peggiorare le frasi fuori tema nella fascia sicura.
 
-**Protezioni:**
-- temperatura 0, per risposte il più ripetibili possibile;
-- prompt che vieta di aggiungere cause, soluzioni o dettagli;
-- output scartato se vuoto o più lungo di 500 caratteri (la stessa lunghezza massima del sintomo);
-- errori che riportano solo il codice HTTP, mai il corpo della risposta, che potrebbe contenere la chiave (verificato da un test).
+### Regola sulla negazione
 
-**Configurazione controllata all'avvio**: se manca una variabile obbligatoria per il provider scelto, `create_app()` si ferma e indica quale manca.
+Gli embedding danno quasi lo stesso vettore a "la pinza chiude completamente" e "la pinza non chiude completamente". `negation_guard.contradicts` scarta un candidato **solo se** una sola delle due frasi contiene una negazione (`non`, `mai`, `nessun*`, `niente`, `nulla`) e, tolte le negazioni, le frasi sono quasi identiche (`token_sort_ratio ≥ 85`).
 
-### 4.6 Autenticazione e permessi
+*Scartata la versione larga* ("una frase ha 'non' e l'altra no"): avrebbe eliminato parafrasi corrette come "la pinza chiude male" → "la pinza non chiude completamente". "senza" è escluso di proposito: descrive più spesso una condizione ("anche senza pezzo") che una negazione.
 
-**JWT Bearer invece delle sessioni lato server.** È supportato in modo nativo da FastAPI (`OAuth2PasswordBearer`, pulsante *Authorize* di Swagger), non richiede una tabella o uno store per le sessioni ed è semplice da usare con un frontend su un'altra porta.
-- *Scartato: sessioni con cookie.* La revoca immediata è più semplice, ma servono uno store e una gestione CORS/cookie più delicata. Il vantaggio della revoca è in gran parte recuperato dal punto successivo.
+## 5. Conversazione, probabilità e domande
 
-**Il ruolo viene riletto dal database a ogni richiesta**, invece di fidarsi di quello scritto nel token. Se un expert viene declassato o un account eliminato, l'effetto è immediato e non alla scadenza del token. È testato in entrambe le direzioni.
+### Conversazione stateless
 
-**Login:**
-- bcrypt con salt casuale: la stessa password produce hash diversi;
-- **bcrypt accetta al massimo 72 byte** e la versione 5 dà errore oltre quel limite. Senza un controllo esplicito, una password lunga causerebbe un `500`. Ora la verifica restituisce `False` e la creazione dell'hash dà un errore esplicito;
-- username inesistente e password sbagliata danno **lo stesso `400` con lo stesso messaggio**. Nel primo caso bcrypt viene eseguito comunque su un hash fittizio, così il tempo di risposta non rivela quali username esistono;
-- l'algoritmo di firma è una lista fissa nel codice e non viene mai letto dall'header del token.
+A ogni turno il client invia contesto, tutti i messaggi e gli id esclusi. Il server non salva nulla.
 
-**Codici `401` e `403`**: non sono nella tabella dei codici standard del progetto (200/201/400/404/409/500), ma sono gli unici corretti per "non autenticato" e "ruolo insufficiente". Sono stati aggiunti.
+- *Scartato per ora: conversazioni salvate su DB.* Servirebbero per registro e feedback, ma aggiungono tabelle, identificativi e pulizia delle sessioni scadute.
+- **Scegliere un'opzione = escludere gli id delle altre opzioni.** Nel piano c'era un `selected_diagnostic_id`, sostituito perché non reggeva più turni di scelta di fila: con le sole esclusioni il server ricostruisce sempre lo stesso stato dagli stessi dati.
+- **Più messaggi dell'operatore**: si tiene il punteggio migliore per diagnosi. Le risposte successive ("sì", "dopo il cambio formato") da sole non corrispondono a nulla, e ricalcolare solo sull'ultimo messaggio farebbe perdere la descrizione iniziale.
 
-### 4.7 API
+### Probabilità con la quota "nessuna di queste"
 
-- **`422` → `400`**: FastAPI risponde `422` quando l'input non è valido, ma la convenzione del progetto usa `400` per ogni richiesta invalida. Un handler in `create_app()` converte il codice.
-- **Regole dei codici**: `404` per una risorsa indicata nell'URL o un riferimento (famiglia/fase) che non esiste; `400` per una combinazione incoerente; `409` per un duplicato. Le regole sono le stesse per diagnosi ed eccezioni.
-- **Un'eccezione si raggiunge solo dalla sua diagnosi**: `/diagnostics/4/exceptions/1` risponde `404` se l'eccezione 1 appartiene a un'altra diagnosi.
-- **Ogni scrittura gira in un savepoint** (`_guarded_write`). Se il database rifiuta la scrittura, si annulla solo quella e la transazione della richiesta resta utilizzabile. L'errore MySQL 1062 (duplicato) diventa `409`.
-- **`catalog_service` aggiunto rispetto al piano**, così anche le route del catalogo passano da un service e non chiamano direttamente un repository.
-- **Route `def`, non `async def`**: SQLAlchemy qui è sincrono. Con `def` FastAPI esegue ogni richiesta in un thread separato; con `async def` una query lenta bloccherebbe tutte le altre richieste.
-- **Oggetti di avvio su `app.state`** invece che in variabili globali: settings, engine, matcher e provider sono creati dentro `create_app()`. Nessuna inizializzazione pesante all'import, e i test possono creare app isolate.
-- **`run.py` con `uvicorn.run("app.main:create_app", factory=True)`**: è uvicorn a chiamare la factory. Host, porta e reload arrivano da `.env`.
-- **Login con form OAuth2** invece che con JSON, così il pulsante *Authorize* di Swagger funziona senza configurazioni. Richiede il pacchetto `python-multipart`.
+Il punteggio del coseno non è una probabilità: 0,62 non vuol dire 62%, e 0,61 contro 0,59 non dice all'operatore da quale ipotesi partire. Una **softmax** trasforma i punteggi in quote che sommano a 100.
 
-### 4.8 Test
+**Primo tentativo (poi corretto):** softmax sulle sole ipotesi. Nello smoke test "il muletto ha una ruota bucata" usciva con **una sola ipotesi al 100%**: formalmente corretto, perché era l'unica, ma letto da un operatore significa certezza.
 
-- **pytest su un database MySQL reale e separato** (`dedalo_test`), ricreato da `schema.sql` + `seed.sql` una volta per sessione. Ogni test gira in una transazione annullata alla fine.
-  - *Scartato: SQLite per i test.* Non supporta allo stesso modo `ENUM`, FULLTEXT e FK composite, quindi i test non rappresenterebbero il database reale.
-- **Protezione**: se `DB_TEST_NAME` coincide con `DB_NAME` i test si rifiutano di partire, perché `schema.sql` cancellerebbe i dati veri.
-- **Nessun mock di componenti interni.** Si simulano solo i confini del sistema:
-  - l'HTTP dei provider AI, con `httpx.MockTransport` e un client passato al costruttore. Questa è una differenza dal piano, che prevedeva `mocker`: non serve sostituire nessun modulo e nessuna chiamata a pagamento può partire;
-  - il modello AI nei test dei service, con piccoli sostituti che implementano `AIProvider`.
-- **Test delle API**: l'unica cosa sostituita è `get_connection`, che nei test usa la connessione della transazione annullata. Route, service, SQL e vincoli restano quelli veri. Un test separato usa la `get_connection` reale, in sola lettura.
-- **Nei test delle API i token vengono generati direttamente**, perché bcrypt costa circa 0,25 secondi a ogni login. Il login vero ha i suoi test dedicati.
-- **I test dei permessi confrontano il contenuto del database** prima e dopo ogni tentativo di scrittura di un operator, per dimostrare che non cambia nulla.
-- **Fixture componibili**: `settings → test_engine → db_connection → client`, più gli header dei due ruoli.
+**Soluzione:** "nessuna di queste" partecipa alla softmax come un candidato in più con punteggio fisso (`PROBABILITY_UNKNOWN_SCORE`). Un'ipotesi molto sopra quel valore gli lascia quasi nulla, una debole gli lascia quasi tutto.
 
-### 4.9 Frontend
+Calibrazione con la NLL media della risposta giusta (per le frasi da trovare le ipotesi attese, per quelle fuori tema "nessuna di queste"):
 
-- **React + Vite in JavaScript** (niente TypeScript per ora), come da standard del progetto. Il template di Vite porta con sé il linter `oxlint`.
-- **Struttura bottom-up**: `services/api.js` → componenti → pagine → `App.jsx`. Solo `api.js` conosce il backend.
-- **Token in `sessionStorage` invece che in `localStorage`.** Su un terminale condiviso in reparto il token si cancella quando si chiude la scheda, così chi arriva dopo non si ritrova loggato con l'account di qualcun altro. Il costo è rifare il login a ogni nuova scheda.
-- **Componente `DiagnosisResult` separato** da `ChatMessageList`, così il modo in cui si mostra una risposta è isolato dall'elenco dei messaggi. Non era nel piano.
-- **Testi dell'interfaccia in italiano**, codice e commenti in inglese.
-- **Pulsanti e campi alti almeno 44px**, pensati per l'uso con le dita su tablet.
-- **Nessuna interfaccia per la gestione della knowledge base**: nel PoC l'esperto usa Swagger.
+| T | senza quota | nessuna = 0,55 | **nessuna = 0,60** | nessuna = 0,65 |
+|---|---|---|---|---|
+| 0,02 | 2,531 | 0,418 | 0,453 | 0,762 |
+| **0,03** | 2,531 | **0,385** | **0,403** | 0,603 |
+| 0,05 | 2,567 | 0,415 | 0,436 | 0,555 |
 
-### 4.10 Archivio funzioni
+Scelti **T = 0,03** e **0,60**, anche se 0,55 ha una NLL leggermente migliore. Con 0,55 le frasi fuori tema lasciavano a "nessuna" spesso meno del 30%, cioè il problema del muletto restava. Con 0,60 le ipotesi giuste nella fascia sicura tengono in media l'89%, e sulle frasi fuori tema "nessuna" va dal 32% al 90%.
 
-La normalizzazione del testo è generica. È stata aggiunta a `function_archive/strings/normalize_text_ita.py` e copiata in `backend/app/utils/` con lo stesso nome, per tracciabilità.
+Le percentuali intere sommano sempre esattamente a 100 grazie al metodo dei resti maggiori. L'interfaccia mostra "<1%" invece di "0%".
 
-## 5. Tentativi che non hanno funzionato
+### Domanda di scelta deterministica
+
+`disambiguation_service.build_choice` confronta le ipotesi "in gara", cioè entro `DISAMBIGUATION_SCORE_GAP` dalla migliore, oppure tutte se la confidenza è bassa:
+
+- sintomi diversi → un'opzione per sintomo;
+- stesso sintomo, componenti diversi (il fermo cella) → un'opzione per componente;
+- stesso sintomo e stesso componente (cause alternative dello stesso guasto) → nessuna domanda: l'operatore non può distinguerle, le verifica in ordine di probabilità.
+
+Distacco tra le prime due ipotesi con sintomi diversi, sulle frasi della fixture:
+
+- prima ipotesi **sbagliata**: 0,003 · 0,008 · 0,009 · 0,043 · 0,047 · 0,193
+- prima ipotesi **giusta**: da 0,021 in su; 4 casi su 30 sotto 0,05
+
+**Gap = 0,05**: la domanda compare in 5 dei 6 casi in cui servirebbe, e inutilmente in 4 casi su 30.
+
+*Superata la "v2 — domanda di disambiguazione" pianificata in v1* (tabelle `disambiguation_questions/options` scritte dall'esperto). Le opzioni costruite dai dati coprono lo stesso bisogno senza lavoro di mappatura. Le tabelle restano un'idea per le domande che i dati non possono esprimere (vedi migliorie).
+
+## 6. Assistente LLM facoltativo
+
+- **Stessa interfaccia `AIProvider` della v1**, con un nuovo metodo `complete_json`. Si cambia provider con `AI_PROVIDER`, come prima. Il `NoopAIProvider` è rimasto come *null object* (`enabled = False`), così il resto del codice riceve sempre un `AIProvider` e non deve controllare `None`.
+- **Il modello riceve** le ipotesi già trovate (id, sintomo, componente, fase, causa, soluzione) e la conversazione, **in un unico documento JSON nel messaggio utente**. Il testo dell'operatore resta dato e non si mescola alle istruzioni del prompt di sistema: è una mitigazione, non una garanzia, contro frasi come "ignora le istruzioni".
+- **Tre azioni ammesse**: `ask`, `narrow`, `no_match`. `parse_decision` rifiuta id non candidati, id booleani (`true` in Python è un `int`), domande vuote, troppo lunghe o oltre `MAX_LLM_QUESTIONS`, azioni sconosciute.
+- **JSON mode**: `response_format: json_object` (OpenAI), `format: json` (Ollama), temperatura 0.
+- **Il modello decide quali ipotesi restano, non l'ordine né le percentuali**: così i numeri restano confrontabili con la modalità offline.
+- **Fallback**: errore HTTP, timeout (`AI_TIMEOUT_SECONDS`), JSON non valido o decisione rifiutata → risposta deterministica con `ai_fallback: true`, motivo nel log.
+- **Non chiamato** se non ci sono candidati: nessun costo e nessun dato inviato per una frase fuori tema.
+- *Scartata la riscrittura del sintomo della v1* (`normalize_symptom`): la ricerca semantica ne ha preso il posto, e un modello che riscrive il testo può trasformarlo in un sintomo sbagliato.
+
+## 7. Interfaccia esperto e CSV
+
+### Interfaccia
+
+- Pagina `/knowledge-base` visibile solo agli `expert`. Nasconderla è una comodità: il controllo vero resta sul backend, testato su ogni endpoint.
+- I componenti non chiamano mai le API: la pagina passa le callback (`services → components → pages`).
+- Ricerca con attesa di 300 ms dopo l'ultimo tasto, per non inviare una richiesta per lettera.
+- `ContextSelector` con etichette configurabili, riusato in chat, nei filtri e nel form invece di tre select duplicate.
+- Eliminazione con `window.confirm`: per un PoC basta, una finestra personalizzata aggiungerebbe un componente senza nuovo comportamento.
+- `utils/saveFile.js` è la prima cartella `utils/` del frontend: far salvare un file al browser non è né un componente né un servizio.
+
+### Formato CSV
+
+- **Separatore `;` e UTF-8 con BOM in export**: senza BOM Excel mostra le lettere accentate come caratteri illeggibili, e con le impostazioni italiane usa `;`.
+- **Import tollerante**: `;` o `,` riconosciuti dall'intestazione, UTF-8 con o senza BOM, ripiego su Windows-1252 (il "CSV" normale di Excel per Windows).
+- **Famiglia per nome, fase per numero**: leggibili in Excel. `phase_name` è esportata ma ignorata in import: due colonne per la stessa informazione potrebbero contraddirsi.
+- **Nomi di famiglia confrontati senza distinguere maiuscole e minuscole**, coerenti con la collation `utf8mb4_unicode_ci` che rende unico il nome.
+- **Protezione CSV injection**: le celle che iniziano con `= + - @` sono esportate con un apostrofo, che l'import toglie. Un ciclo export → Excel → import non altera i dati (testato).
+
+### Regole di import
+
+- **Upsert per `id`**: `id` vuoto crea, `id` esistente aggiorna, `id` inesistente è un errore. *Scartato* creare silenziosamente l'id: un numero sbagliato produrrebbe duplicati invisibili.
+- **Nessuna cancellazione da CSV**: una riga dimenticata nel file non deve eliminare una diagnosi.
+- **Anteprima di default** (`dry_run=true`): conta le righe da aggiungere, da modificare e **invariate** (confrontando i valori reali, così un export reimportato dà 0 modifiche).
+- **Tutto o niente**: con un errore, `400` con il report e nessuna scrittura. Le scritture usano la transazione della richiesta, quindi un errore a metà annulla anche le righe già scritte.
+- **Errori in italiano con riga e colonna** (compresa la riga di inizio quando una cella va a capo): li legge direttamente l'esperto. La famiglia sbagliata elenca le famiglie valide.
+- Limiti: 2 MB e 5000 righe.
+- *Scartato: "sostituisci tutto".* Comodo al primo caricamento, ma un file sbagliato cancellerebbe la knowledge base.
+
+## 8. Test
+
+- **338 test, copertura 99%.** La riga non coperta è la creazione del modello vero dentro `create_app()`, che i test sostituiscono.
+- **Embedder finto (bag of words con hashing)** nell'app di test: la suite non carica il modello e dura circa 30 secondi. I punteggi dipendono solo dalle parole in comune, quindi i casi del seed sono stabili. Prima di scrivere i test di conversazione ho misurato i punteggi reali dell'embedder finto sul seed, per scrivere le aspettative consapevolmente e non adattarle ai risultati.
+- **Test `model`** (`tests/test_model_quality.py`): modello vero sulla fixture, con minimi poco sotto i valori misurati (trovate ≥ 46/48, prime ≥ 38/48, nessuna frase fuori tema sicura, negazioni 3/3). Un cambio di modello o di soglia che peggiora il matching fa fallire la suite.
+- **Il fixture `settings` fissa le soglie calibrate**, così una taratura locale del `.env` non cambia l'esito dei test.
+- **Il passo LLM** è testato con provider sostitutivi e con `httpx.MockTransport`, per i casi: domanda, restringimento, `no_match`, id inventato, provider giù, limite di domande, nessuna chiamata senza candidati.
+- **RBAC**: un operatore riceve 403 su creazione, modifica, eliminazione, import, export e modello, e il contenuto della tabella non cambia.
+- **Smoke test HTTP** sul backend reale (DB di test, modello vero): fermo cella, esclusione, negazione, frase fuori tema, export, modello, anteprima, import, file con errori, 403, diagnosi importata ritrovata con una parafrasi. Tempi di risposta 90-150 ms.
+
+## 9. Tentativi che non hanno funzionato (v2)
 
 | Tentativo | Cosa è successo | Come è stato risolto |
 |---|---|---|
-| `token_set_ratio` come scorer (previsto nel piano) | la misura sui dati del seed ha mostrato diagnosi sbagliate: 81.6 per un sintomo diverso sullo stesso componente, 100 per una parola sola | sostituito da `token_sort_ratio` (vedi 4.3) |
-| FULLTEXT di MySQL come motore di matching | 0 risultati con un refuso | rapidfuzz; l'indice resta come futuro pre-filtro |
-| Creazione del venv su Ubuntu | `ensurepip is not available` | installato `python3.12-venv`, poi `python3 -m venv --clear` |
-| Installazione di MariaDB | non necessaria: MySQL 8 era già attivo | usato MySQL 8 |
-| Node.js dai pacchetti di Ubuntu | versione 18, troppo vecchia per Vite (richiede `^20.19` o `>=22.12`) | Node 24 LTS installato con nvm, senza `sudo` |
-| `python -c "..."` con molte virgolette annidate nelle verifiche da terminale | errori di interpretazione della shell | script passati con heredoc (`python - <<'EOF'`) |
+| Installazione di torch in background con percorsi relativi | la shell non trovava `.venv/bin/pip`, ma l'esito era 0 perché l'ultimo comando della pipe era `tail` | percorsi assoluti e `set -o pipefail` |
+| MiniLM, mpnet ed e5 con soglia assoluta | nessuna soglia separava le frasi fuori tema da quelle giuste (sezione 4) | modello italiano |
+| Soglia relativa (primo punteggio meno media o mediana) | +1 punto, ma dipende dalla composizione della knowledge base | scartata, soglia assoluta a due livelli |
+| Regola larga sulla negazione | avrebbe scartato parafrasi corrette | scarto solo se le frasi, senza negazioni, sono quasi identiche |
+| Domanda di scelta basata sul primo sintomo diverso | con tre cause dello stesso fermo cella e un sintomo più lontano in fondo, raggruppava per sintomo e non chiedeva nulla, proprio nel caso di `update.md` | domanda solo sulle ipotesi "in gara", raggruppate per sintomo o componente |
+| Softmax sulle sole ipotesi | un'ipotesi incerta e unica appariva al 100% (smoke test) | quota "nessuna di queste" calibrata |
+| `selected_diagnostic_id` nella richiesta (piano) | non reggeva più turni di scelta senza stato sul server | solo `excluded_diagnostic_ids` |
+| `caplog` nel test del warm-up senza database | nessun messaggio catturato: `dictConfig` in `create_app()` rimuove l'handler di pytest dal logger root | handler riaggiunto nel test |
+| Cancellazione dei file v1 non più usati (piano) | il vincolo di progetto vieta di cancellare file senza permesso esplicito | file riusati: `diagnosis_service.py` contiene la conversazione, `fuzzy_matcher.py` è la baseline v1 dello script, `NoopAIProvider` è un null object |
 
-## Limiti conosciuti
+## 10. Limiti conosciuti
 
-### Matching
+### Matching e probabilità
 
-1. **⚠️ La negazione pesa pochissimo.** "non" viene conservato, ma è una sola parola di differenza. Misurato: "La pinza del robot **chiude** completamente" prende **94.1** contro "…**non** chiude completamente", e quindi trova la diagnosi del sintomo opposto. È il limite più rilevante rispetto al principio anti-allucinazione (vedi le migliorie possibili).
-2. **Una parola diversa su poche pesa poco anche in generale.** "si blocca a intermittenza" prende 88.9 contro "si ferma a intermittenza". Qui l'effetto è utile, perché i due verbi sono quasi sinonimi, ma il meccanismo è lo stesso del punto 1.
-3. **Le descrizioni molto più corte del sintomo registrato non trovano nulla.** "pinza non chiude" prende 61.5; "nastro fermo" contro "si ferma a intermittenza" prende 75.8. Risultato: `no_match`. È voluto (vedi 4.3), ma obbliga l'operatore a descrizioni abbastanza complete.
-4. **Nessuna gestione di sinonimi o radici delle parole** ("fermo" / "ferma" / "arresto"). Le stopword sono una lista scritta a mano.
-5. **Soglia unica e globale** (`MATCH_SCORE_THRESHOLD`), calibrata solo sulle frasi del seed e non su dati reali di linea. Non varia per famiglia.
-6. **Tutte le diagnosi vengono confrontate a ogni richiesta.** Va bene per centinaia o poche migliaia di righe; oltre serve un pre-filtro, per esempio con l'indice FULLTEXT già presente.
-7. **Una sola risposta per richiesta**: con più ipotesi vicine l'operatore riceve la lista e deve scegliere da solo (vedi i prossimi passi).
+1. **Calibrato su 60 frasi sintetiche** scritte durante lo sviluppo, non su richieste reali di operatori. Soglie, temperatura e quota "nessuna" vanno ricalibrate con dati veri: aggiungere frasi alla fixture e rilanciare lo script.
+2. **Modello solo italiano**, mantenuto da un singolo autore (MIT, circa 2.300 download). In un reparto multilingue servirebbe e5 (ranking migliore, ma senza soglia assoluta affidabile) o un altro modello da calibrare.
+3. **Il lessico di reparto** (sigle, nomi interni di macchine) non è noto al modello: i sinonimi aziendali possono non essere riconosciuti.
+4. **Negazione**: la regola copre solo frasi quasi identiche. Una negazione espressa con parole diverse può ancora avvicinare il sintomo opposto.
+5. **Frasi fuori tema nella fascia incerta**: 6 su 9 mostrano ipotesi, con avviso e quota "nessuna" alta. Non vengono mai presentate come sicure, ma compaiono.
+6. **Probabilità stimate**: la quota "nessuna" è una stima calibrata, non la frequenza reale delle cause mancanti.
+7. **Tutti i candidati del contesto** vengono letti e confrontati a ogni richiesta, e la cache non libera mai i testi modificati. Va bene fino a qualche migliaio di righe.
+8. **Download del modello** da Hugging Face al primo avvio: serve internet una volta, oppure copiare la cache su una macchina offline.
 
-### AI
+### Assistente AI
 
-8. **Il fallback AI può riscrivere il sintomo in uno sbagliato** che poi trova corrispondenza. Le mitigazioni sono l'AI spenta di default, l'uso solo quando il testo originale non trova nulla e l'indicazione "interpretato come". Il rischio però resta.
-9. **`LocalAIProvider` è testato solo con HTTP simulato**, non con un vero modello Ollama. Qualità del prompt e comportamento dei modelli reali sono da validare.
-10. **`AI_PROVIDER=api` manda il testo dell'operatore fuori dalla rete aziendale.** Va bene per il PoC, non per dati di produzione.
+9. **Mai provato con OpenAI reale**: prompt e qualità delle domande sono da validare. Costi a consumo.
+10. **`AI_PROVIDER=api` invia fuori dalla rete aziendale** conversazione, cause e soluzioni candidate.
+11. **Ollama su CPU** è lento (secondi per risposta) e un modello piccolo segue le istruzioni peggio. Il fallback evita il blocco, ma la conversazione AI diventa di fatto offline.
 
-### Sicurezza e gestione
+### Gestione e sicurezza
 
-11. **Il singolo token non si può revocare** prima della scadenza (8 ore), anche se ruolo ed esistenza dell'utente vengono riverificati a ogni richiesta.
-12. **Il token in `sessionStorage` è leggibile da JavaScript**, quindi esposto a eventuali vulnerabilità XSS. Un cookie `HttpOnly` sarebbe più sicuro, ma più complesso con CORS.
-13. **Nessun limite ai tentativi di login** (rate limiting) e nessuna configurazione HTTPS: il PoC è pensato per l'uso in locale.
-14. **Credenziali demo nel seed**, documentate nel README e da rimuovere prima di un uso reale.
-15. **Nessun registro delle consultazioni** e nessun feedback dell'operatore ("la soluzione ha funzionato?"): oggi non si può misurare l'efficacia della knowledge base.
+12. **Conversazione non salvata**: nessun registro e nessun feedback ("la soluzione ha funzionato?"). Non si possono misurare MTTD/MTTR né trovare i sintomi scoperti.
+13. **Famiglie, fasi e utenti** non si gestiscono dall'interfaccia (SQL o Swagger). Eliminare una famiglia usata è bloccato dalle FK.
+14. **Nessuna cronologia delle modifiche** alla knowledge base: una diagnosi modificata o eliminata non si recupera.
+15. **Token non revocabile** prima della scadenza, **token in `sessionStorage`** leggibile da JavaScript, **nessun rate limiting** sul login, **credenziali demo** nel seed (invariati dalla v1).
+16. **Messaggi di errore del backend in inglese**, tranne l'import CSV.
+17. **Nessun test automatico del frontend**: build, lint e prove manuali.
+18. **`requirements.txt` fissa `torch==2.14.0+cpu`**, che richiede l'installazione preventiva dall'indice CPU.
+19. Warning di deprecazione `httpx2` di Starlette nei test; file del template Vite non tracciati e favicon di Vite ancora presenti.
 
-### Frontend e manutenzione
+## 11. Migliorie possibili
 
-16. **Nessuna interfaccia per l'esperto**: la knowledge base si gestisce da Swagger.
-17. **Nessun test automatico del frontend**: verificato con build, lint e prove manuali.
-18. **Alcuni messaggi di errore del backend sono in inglese** e compaiono così nell'interfaccia italiana, per esempio "Product family not found". I casi principali (login errato, `no_match`, server non raggiungibile) sono tradotti nel frontend.
-19. **Warning di deprecazione nei test**: Starlette avvisa che in una versione futura il `TestClient` richiederà il pacchetto `httpx2` al posto di `httpx`. Oggi non ha effetti; se un aggiornamento delle dipendenze rompe i test, la causa è questa.
-20. **Nel repository restano, non tracciati, alcuni file del template di Vite non usati** (`src/App.css`, `src/index.css`, `src/assets/`, `public/icons.svg`, `frontend/README.md`), in attesa di essere eliminati. L'icona della scheda del browser (`favicon.svg`) è ancora il logo di Vite.
+- **Registro delle conversazioni e feedback**, per calibrare le soglie sulle frasi reali e trovare i sintomi senza copertura.
+- **Dizionario di sinonimi di reparto** scritto dagli esperti, applicato prima dell'embedding (deterministico).
+- **Domande scritte dall'esperto** per i casi che le opzioni automatiche non esprimono (per esempio "si sente un rumore?").
+- **Fine-tuning del modello** su coppie (frase dell'operatore, sintomo) raccolte dal registro.
+- **Gestione di famiglie, fasi e utenti** dall'interfaccia, e **cronologia delle modifiche**.
+- **Pre-filtro** (per esempio indice vettoriale o FULLTEXT) quando la knowledge base supererà qualche migliaio di righe.
+- **Test del frontend** (Vitest + React Testing Library) e **CI** con GitHub Actions.
+- **Rate limiting, HTTPS e cookie `HttpOnly`** prima di un uso fuori dalla rete locale.
 
-## Prossimi passi pianificati
+---
 
-### v2 — Domanda di disambiguazione (un solo livello)
+# Parte 2 — v1
 
-**Cosa.** Quando due o più candidati superano la soglia con punteggi **vicini tra loro** (distanza ≤ `DISAMBIGUATION_SCORE_GAP`, configurabile, indicativamente 5-10 punti), il sistema non restituisce più l'elenco delle ipotesi. Propone invece **una sola domanda** scritta dall'esperto, con **risposte a scelta chiusa**. Ogni risposta punta a uno dei candidati (`base_diagnostic_id`). Dopo la risposta si mostra la diagnosi di quel candidato, con le eventuali eccezioni applicate come oggi.
+Stato al 14/09/2026: PoC v1 completo (matching fuzzy deterministico, eccezioni per fase, AI facoltativa di sola riscrittura del sintomo). Qui restano le decisioni **ancora valide** e la storia di quelle superate.
 
-Caratteristiche:
-- **deterministica**: nessun testo generato, domanda e risposte sono scritte dall'esperto;
-- **un solo livello**: niente grafo di domande, niente ricorsione, profondità massima 1;
-- **opzionale**: se per quel gruppo di candidati non esiste una domanda, il comportamento resta quello della v1 (elenco ordinato per punteggio).
+## Vincoli del brief (validi in v2)
 
-**Perché non è nella v1.**
-- **Rischio di esplosione combinatoria.** Un vero albero decisionale multi-livello obbligherebbe l'esperto a prevedere e scrivere ogni ramo, con uno sforzo di mappatura che cresce molto in fretta e che è difficile tenere aggiornato.
-- **Prima va validato il matching di base.** Bisogna capire nella pratica quanto spesso si verificano pareggi e su quali sintomi. Sono proprio questi dati a indicare dove vale la pena scrivere una domanda.
-- **Si aggiunge senza toccare il motore esistente**: è un livello sopra il matching, non un suo sostituto.
+| Vincolo | Come è rispettato |
+|---|---|
+| **Offline-first** | embedding in locale; AI spenta di default; `api` documentata come adatta solo alla validazione |
+| **Determinismo prima dell'NLP** | candidati, ordine, probabilità e domande offline sono deterministici; l'LLM non scrive mai cause o soluzioni |
+| **RBAC** `expert` / `operator` | ruolo riletto dal DB a ogni richiesta, test su ogni endpoint di scrittura |
+| **Fallback anti-allucinazione** | tre fasce con avviso, quota "nessuna di queste", `no_match` con messaggio fisso |
+| **Provider AI intercambiabile** | interfaccia `AIProvider` e factory, una variabile in `.env` |
 
-**Modifiche previste al database (solo tabelle nuove, nessun `ALTER` su quelle esistenti):**
+## Decisioni v1 ancora valide
 
-```sql
-disambiguation_questions (
-    id, question_text,
-    family_id       FK → product_families  NULL,   -- NULL = valida per tutte le famiglie
-    cycle_phase_id  NULL,                          -- NULL = valida per tutte le fasi
-    created_by      FK → users,
-    created_at, updated_at
-    -- coerenza fase/famiglia: stessa FK composita su cycle_phases (id, family_id)
-)
+**Accesso al database: SQLAlchemy Core** con `text()` e parametri.
+- *Scartato ORM*: seconda definizione dello schema da tenere allineata con `schema.sql`. *Scartato solo PyMySQL*: connessioni e transazioni a mano.
+- `pool_pre_ping` + `pool_recycle=3600`: MySQL chiude le connessioni inattive dopo 8 ore.
+- Una transazione per richiesta (`get_connection`).
+- `rowcount` degli update conta le righe *trovate* (flag del dialetto PyMySQL), non quelle *modificate*.
+- Pacchetto `cryptography` necessario per `caching_sha2_password` di MySQL 8.
 
-disambiguation_options (
-    id,
-    question_id         FK → disambiguation_questions  ON DELETE CASCADE,
-    option_text,
-    base_diagnostic_id  FK → base_diagnostics          ON DELETE CASCADE,
-    UNIQUE (question_id, base_diagnostic_id)
-)
-```
+**Normalizzazione del testo** (`normalize_text_ita`, copiata da `function_archive`): minuscolo, accenti rimossi con NFKD, punteggiatura in spazi, stopword italiane rimosse, **"non" conservato**. In v2 serve al punteggio fuzzy e alla regola sulla negazione.
 
-A runtime: dato l'insieme S dei candidati con punteggi vicini, si sceglie la domanda del contesto più specifico (famiglia + fase, poi solo famiglia, poi generica) le cui opzioni coprono **tutti** i candidati di S. Le opzioni puntano alla diagnosi generica, quindi l'eventuale eccezione della fase si applica da sola, dopo la scelta.
+**Scorer fuzzy `token_sort_ratio`** (misurato in v1 contro `token_set_ratio`, `ratio`, `WRatio`): `token_set_ratio` e `WRatio` davano punteggi alti con una parola sola o con un sintomo diverso sullo stesso componente; `ratio` non reggeva le parole in ordine diverso. In v2 resta come componente del punteggio e come baseline dello script.
 
-**Predisposizioni già presenti nella v1**, grazie alle quali non servirà un refactor:
-- ✅ ogni risultato del matcher è identificato da `base_diagnostic_id` e conserva il proprio punteggio. Le righe non vengono mai raggruppate per testo del sintomo, perché le opzioni della v2 puntano a righe precise;
-- ✅ la risposta di `/diagnosis` ha il campo `status`: `disambiguation` diventerà un terzo valore senza rompere il formato della risposta;
-- ✅ l'eccezione viene applicata sul candidato già identificato, quindi funzionerà allo stesso modo dopo la scelta dell'operatore;
-- ✅ il frontend (`DiagnosisResult`) sceglie cosa mostrare in base a `status` e ha un ramo di default per gli stati sconosciuti.
+**Autenticazione:**
+- JWT Bearer invece delle sessioni lato server (supporto nativo FastAPI e Swagger, nessuno store di sessione). *Scartati i cookie di sessione*: revoca più semplice, ma serve uno store e CORS più delicato.
+- Ruolo **riletto dal database a ogni richiesta**: un declassamento vale subito.
+- bcrypt con limite di 72 byte gestito esplicitamente (niente `500`).
+- Utente inesistente e password sbagliata: stesso `400`, stesso messaggio, bcrypt eseguito comunque (niente user enumeration né timing attack).
+- Algoritmo di firma fisso nel codice.
 
-Da aggiungere nella v2:
-- le due tabelle;
-- il CRUD delle domande per l'expert;
-- la logica di selezione della domanda nel `diagnosis_service`;
-- un endpoint o un campo per inviare la risposta scelta;
-- il componente che mostra la domanda nel frontend.
+**API:**
+- `422` → `400` con un handler, per coerenza con la convenzione del progetto.
+- Route `def`, non `async def`: SQLAlchemy qui è sincrono.
+- Oggetti di avvio su `app.state` dentro `create_app()`, nessuna inizializzazione pesante all'import. In v2 anche il modello di embedding, caricato **dopo** il controllo della configurazione AI, così un errore di configurazione si vede subito.
+- `run.py` con `uvicorn.run("app.main:create_app", factory=True)`.
+- Login con form OAuth2, per il pulsante *Authorize* di Swagger.
 
-## Migliorie possibili (non pianificate)
+**Test:** MySQL reale e separato (`dedalo_test`, *scartato SQLite*: non supporta allo stesso modo FK composite, `CHECK`, `ENUM`); rifiuto di partire se `DB_TEST_NAME == DB_NAME`; transazione annullata per test; mock solo ai confini (HTTP dei provider).
 
-Idee emerse durante lo sviluppo, da valutare dopo la validazione del PoC:
+**Frontend:** React + Vite in JavaScript; token in `sessionStorage` (terminali condivisi); pulsanti e campi alti almeno 44 px (tablet); testi in italiano, codice in inglese.
 
-- **Controllo di coerenza della negazione** (limite 1): regola deterministica che scarta un candidato quando la richiesta e il sintomo non concordano sulla presenza di "non". È semplice e resta a regole.
-- **Calibrare la soglia su dati reali**, raccogliendo richieste degli operatori e l'esito atteso.
-- **Sinonimi e radici delle parole** gestiti a regole (dizionario di dominio scritto dagli esperti), prima di passare a un livello semantico.
-- **`SemanticMatcher` locale** (sentence-transformers eseguito in azienda) dietro l'interfaccia `Matcher` già esistente.
-- **Pre-filtro FULLTEXT** quando la knowledge base diventerà grande.
-- **Interfaccia per l'esperto** per gestire la knowledge base senza Swagger.
-- **Registro delle consultazioni e feedback dell'operatore**, per misurare MTTD/MTTR e trovare i sintomi senza copertura (`no_match` frequenti).
-- **Test automatici del frontend** (per esempio Vitest + React Testing Library).
-- **Messaggi di errore del backend tradotti** o gestiti con codici invece che con testo.
-- **Rate limiting sul login, HTTPS, cookie `HttpOnly`** prima di un uso fuori dalla rete locale.
-- **Docker e CI** (GitHub Actions per test e lint) quando servirà distribuire il sistema.
+## Decisioni v1 superate in v2
+
+| v1 | v2 | Perché |
+|---|---|---|
+| fuzzy rapidfuzz come motore, soglia 80 | embedding italiano + fuzzy, soglie 0,50 / 0,65 | 3/48 contro 47/48 sulle frasi da operatore |
+| `base_diagnostics` + `diagnostic_exceptions` | `diagnostics` con famiglia e fase facoltative | un concetto in meno, CSV 1:1 con Excel, fasi facoltative |
+| famiglia e fase obbligatorie | fase facoltativa | il fermo cella non dice in quale fase sta il guasto |
+| indice FULLTEXT pronto come pre-filtro | rimosso | mai usato; la ricerca semantica ne prende il posto |
+| lista di ipotesi con "somiglianza %" | ipotesi con probabilità stimata e quota "nessuna" | il punteggio non è una probabilità |
+| AI che riscrive il sintomo se non c'è match | AI facoltativa che fa domande e restringe | una riscrittura può produrre un sintomo sbagliato |
+| v2 pianificata: domande scritte dall'esperto in tabelle | opzioni costruite dai dati | nessun lavoro di mappatura, stesso bisogno coperto |
+| knowledge base gestita da Swagger | interfaccia esperto + CSV | richiesta di `update.md` |
+
+## Tentativi che non hanno funzionato (v1)
+
+| Tentativo | Cosa è successo | Come è stato risolto |
+|---|---|---|
+| `token_set_ratio` come scorer | 81,6 per un sintomo diverso sullo stesso componente, 100 per una parola sola | `token_sort_ratio` |
+| FULLTEXT di MySQL come motore | 0 risultati con un refuso | rapidfuzz (oggi embedding + fuzzy) |
+| Creazione del venv su Ubuntu | `ensurepip is not available` | `python3.12-venv` |
+| Installazione di MariaDB | non necessaria | MySQL 8 già attivo |
+| Node.js dai pacchetti di Ubuntu | versione 18, troppo vecchia per Vite | Node 24 LTS con nvm |
+| `python -c "..."` con virgolette annidate | errori della shell | heredoc (`python - <<'EOF'`) |
