@@ -1,132 +1,69 @@
-from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import Literal
 
 from rapidfuzz import fuzz
 
+from app.services.matching.base import Matcher, MatchCandidate, MatchResult, sort_results
 from app.utils.normalize_text_ita import normalize_text_ita
 
 
-@dataclass(frozen=True)
-class MatchCandidate:
-    """A base diagnostic, with its exception for the requested context if one exists.
+def fuzzy_score(query: str, symptom: str) -> float:
+    """String similarity of two Italian texts after normalization.
 
-    Field names match the keys returned by
-    ``diagnostics_repository.list_match_candidates``, so ``MatchCandidate(**row)`` works.
+    token_sort_ratio compares the full sorted word lists: robust to typos and word
+    order, but unlike token_set_ratio/WRatio it does not give a high score when the
+    query shares only a subset of words with the symptom (e.g. "nastro" alone).
+    The v1 scorer comparison is documented in workflow_sviluppo.md.
+
+    Args:
+        query: Text typed by the operator.
+        symptom: Symptom description stored in the knowledge base.
+
+    Returns:
+        A score between 0 and 1.
     """
-
-    base_diagnostic_id: int
-    symptom_description: str
-    affected_component: str
-    probable_cause: str
-    recommended_solution: str
-    exception_id: int | None = None
-    specific_cause: str | None = None
-    specific_solution: str | None = None
-
-
-@dataclass(frozen=True)
-class MatchResult:
-    """A candidate that passed the threshold, with the cause/solution to show.
-
-    ``base_diagnostic_id`` always identifies the matched row, even when an
-    exception replaced its cause and solution.
-    """
-
-    base_diagnostic_id: int
-    exception_id: int | None
-    symptom_description: str
-    affected_component: str
-    cause: str
-    solution: str
-    source: Literal["base", "exception"]
-    score: float
-
-
-class Matcher(ABC):
-    """Interface of a symptom matcher.
-
-    The diagnosis service depends only on this interface, so a future semantic
-    matcher (e.g. local sentence-transformers) can replace or complement the fuzzy one.
-    """
-
-    @abstractmethod
-    def match(self, query: str, candidates: Sequence[MatchCandidate]) -> list[MatchResult]:
-        """Returns the candidates that match the query, best first.
-
-        Args:
-            query: Free-text symptom typed by the operator.
-            candidates: Diagnostics available for the selected family and phase.
-
-        Returns:
-            Matching results; an empty list means no certain match.
-        """
+    return fuzz.token_sort_ratio(normalize_text_ita(query), normalize_text_ita(symptom)) / 100
 
 
 class FuzzyMatcher(Matcher):
-    """Deterministic matcher based on string similarity of normalized symptoms."""
+    """String-similarity matcher: the v1 engine.
 
-    def __init__(self, threshold: float = 80.0) -> None:
+    No longer used by the application, which relies on SemanticMatcher. It is kept as
+    the baseline in scripts/evaluate_matching.py, so the v1 -> v2 improvement is measured
+    on the same queries instead of being estimated.
+    """
+
+    def __init__(self, threshold: float = 0.8, max_results: int = 5) -> None:
         """Initializes the matcher.
 
         Args:
-            threshold: Minimum similarity score (0-100) for a candidate to match.
+            threshold: Minimum similarity score (0-1) for a candidate to match.
+            max_results: Maximum number of results.
 
         Raises:
-            ValueError: If the threshold is outside the 0-100 score range.
+            ValueError: If threshold is outside 0-1 or max_results is not positive.
         """
-        if not 0.0 <= threshold <= 100.0:
-            raise ValueError(f"threshold must be between 0 and 100, got {threshold}")
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(f"threshold must be between 0 and 1, got {threshold}")
+        if max_results < 1:
+            raise ValueError(f"max_results must be positive, got {max_results}")
         self.threshold = threshold
+        self.max_results = max_results
 
     def match(self, query: str, candidates: Sequence[MatchCandidate]) -> list[MatchResult]:
         """Scores every candidate against the query and keeps those above the threshold.
 
         Args:
             query: Free-text symptom typed by the operator.
-            candidates: Diagnostics available for the selected family and phase.
+            candidates: Diagnostics that apply to the operator's context.
 
         Returns:
-            Results ordered by score (highest first), ties broken by diagnostic id
-            so the order is always reproducible. Empty if nothing reaches the threshold.
+            Up to max_results results, ordered by score, scope specificity and id.
         """
-        normalized_query = normalize_text_ita(query)
-        if not normalized_query:
+        if not normalize_text_ita(query):
             return []
-
         results = []
         for candidate in candidates:
-            # token_sort_ratio compares the full sorted word lists: robust to typos and
-            # word order, but unlike token_set_ratio/WRatio it does not give a high score
-            # when the query shares only a subset of words with the symptom (e.g. "nastro"
-            # alone, or same component with a different symptom). Scorer comparison on the
-            # seed phrases is documented in workflow_sviluppo.md.
-            score = fuzz.token_sort_ratio(normalized_query, normalize_text_ita(candidate.symptom_description))
+            score = round(fuzzy_score(query, candidate.symptom_description), 4)
             if score >= self.threshold:
-                results.append(_build_result(candidate, score))
-
-        return sorted(results, key=lambda result: (-result.score, result.base_diagnostic_id))
-
-
-def _build_result(candidate: MatchCandidate, score: float) -> MatchResult:
-    """Builds the result, letting a context exception replace cause and solution.
-
-    Args:
-        candidate: The matched candidate.
-        score: Similarity score obtained by the candidate.
-
-    Returns:
-        The result with base or exception cause/solution.
-    """
-    has_exception = candidate.exception_id is not None
-    return MatchResult(
-        base_diagnostic_id=candidate.base_diagnostic_id,
-        exception_id=candidate.exception_id,
-        symptom_description=candidate.symptom_description,
-        affected_component=candidate.affected_component,
-        cause=candidate.specific_cause if has_exception else candidate.probable_cause,
-        solution=candidate.specific_solution if has_exception else candidate.recommended_solution,
-        source="exception" if has_exception else "base",
-        score=score,
-    )
+                results.append(MatchResult(candidate=candidate, score=score))
+        return sort_results(results)[: self.max_results]
