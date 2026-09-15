@@ -1,0 +1,25 @@
+# Dependencies of the Dedalo desktop app (Windows build) and of its build tools.
+# No PyTorch: embeddings run with ONNX Runtime. Installed by build.ps1 in build\venv-desktop;
+# the exact versions of every package of a build are saved in build\requirements-desktop.lock.txt.
+
+# Runtime (bundled into the app)
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn==0.53.0
+SQLAlchemy==2.0.52
+pydantic==2.13.5
+pydantic-settings==2.15.0
+PyJWT==2.14.0
+bcrypt==5.0.0
+httpx==0.28.1
+python-multipart==0.0.32
+RapidFuzz==3.14.6
+numpy==2.5.3
+onnxruntime==1.30.0
+tokenizers==0.23.2
+pywebview==6.2.1
+
+# Build tools (not bundled)
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.7
+pillow==12.3.0
