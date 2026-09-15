@@ -1,37 +1,18 @@
--- Dedalo — sample data. Run after schema.sql on the same database:
---   mysql dedalo < database/seed.sql
+-- Dedalo — demo users and sample diagnostics for development and tests. Valid for MySQL and SQLite.
+-- Run after the schema and seed_catalog.sql on the same database:
+--   mysql --default-character-set=utf8mb4 dedalo < database/seed.sql
 --
 -- Explicit ids keep the data deterministic: the pytest suite and
 -- backend/tests/fixtures/operator_queries.json rely on them as known cases.
+-- The desktop app never loads this file (no demo credentials in the installer).
 --
 -- Demo credentials (development only):
 --   expert_demo   / expert123
 --   operator_demo / operator123
 
-SET NAMES utf8mb4;
-
 INSERT INTO users (id, username, password_hash, role) VALUES
     (1, 'expert_demo',   '$2b$12$Ufrmq0TLW3un3cjpJI1EgOWXjkNcoXIQkn2iW2J1rZV1QcpUBam02', 'expert'),
     (2, 'operator_demo', '$2b$12$OYQxnobvq0uEZTbtolJBmOXE7HVK82PCdwCbqRbCjCRqXqutt2DHm', 'operator');
-
-INSERT INTO product_families (id, family_name, description) VALUES
-    (1, 'Cella di assemblaggio robotizzata', 'Cella con robot antropomorfo, pinza pneumatica, avvitatore elettrico e sistema di visione'),
-    (2, 'Confezionatrice flow-pack',         'Macchina orizzontale per confezionamento in film termosaldabile'),
-    (3, 'Cella di saldatura robotizzata',    'Cella MIG/MAG con robot di saldatura, staffaggi pneumatici e nastro trasportatore pallet');
-
-INSERT INTO cycle_phases (id, family_id, phase_number, phase_name) VALUES
-    (1,  1, 1, 'Carico pezzo'),
-    (2,  1, 2, 'Serraggio in pinza'),
-    (3,  1, 3, 'Avvitatura'),
-    (4,  1, 4, 'Scarico'),
-    (5,  2, 1, 'Svolgimento film'),
-    (6,  2, 2, 'Formatura tubolare'),
-    (7,  2, 3, 'Saldatura trasversale'),
-    (8,  2, 4, 'Taglio e scarico'),
-    (9,  3, 1, 'Ingresso pallet'),
-    (10, 3, 2, 'Bloccaggio pezzo'),
-    (11, 3, 3, 'Saldatura'),
-    (12, 3, 4, 'Uscita pallet');
 
 -- Ids 1-10: generic (valid for every family).
 -- Ids 1-2: same symptom, two alternative causes.

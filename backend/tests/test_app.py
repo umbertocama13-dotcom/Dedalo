@@ -31,7 +31,9 @@ def test_startup_warms_up_the_embedding_cache(settings: Settings, test_engine: E
 
 
 def test_startup_survives_an_unreachable_database(settings: Settings, caplog: pytest.LogCaptureFixture) -> None:
-    app = create_app(settings.model_copy(update={"db_port": 1}), embedder=FakeEmbedder())
+    # Port 1 for MySQL; for SQLite, a file inside a folder that does not exist cannot be opened.
+    unreachable = settings.model_copy(update={"db_port": 1, "sqlite_path": "/nonexistent-dedalo-folder/dedalo.db"})
+    app = create_app(unreachable, embedder=FakeEmbedder())
     # create_app() reconfigures logging with dictConfig, which removes pytest's capture
     # handler from the root logger: add it back for this test.
     root_logger = logging.getLogger()
@@ -79,4 +81,7 @@ def test_openapi_documents_every_route(app: FastAPI) -> None:
         "/diagnostics/import-template",
         "/diagnostics/import",
         "/diagnostics/{diagnostic_id}",
+        "/setup/status",
+        "/setup",
+        "/users",
     }

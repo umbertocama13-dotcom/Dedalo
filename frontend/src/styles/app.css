@@ -155,6 +155,29 @@ code {
   color: var(--muted);
 }
 
+.setup-form {
+  width: min(100%, 460px);
+}
+
+label.checkbox {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 0.6rem;
+  font-weight: 400;
+}
+
+label.checkbox input {
+  width: auto;
+  min-height: auto;
+  margin-top: 0.2rem;
+}
+
+.user-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
 .loading-page {
   padding: 2rem;
   text-align: center;

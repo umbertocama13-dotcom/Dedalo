@@ -1,8 +1,8 @@
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
@@ -19,10 +19,13 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=ENV_FILE, env_file_encoding="utf-8", extra="ignore")
 
+    # mysql = development and server installs; sqlite = single-PC desktop app (one local file).
+    db_backend: Literal["mysql", "sqlite"] = "mysql"
+    sqlite_path: str = "dedalo.db"
     db_host: str = "localhost"
     db_port: int = 3306
-    db_user: str
-    db_password: str
+    db_user: str = ""
+    db_password: str = ""
     db_name: str = "dedalo"
     db_test_name: str = "dedalo_test"
 
@@ -32,7 +35,10 @@ class Settings(BaseSettings):
 
     # Defaults calibrated on tests/fixtures/operator_queries.json with scripts/evaluate_matching.py
     # (numbers and alternatives in workflow_sviluppo.md).
+    # sentence-transformers = development (PyTorch); onnx = desktop app, same model exported to ONNX.
+    embedding_backend: Literal["sentence-transformers", "onnx"] = "sentence-transformers"
     embedding_model: str = "nickprock/sentence-bert-base-italian-xxl-uncased"
+    onnx_model_dir: str = str(ENV_FILE.parent / "models" / "sentence-bert-base-italian-xxl-uncased")
     embedding_query_prefix: str = ""
     embedding_document_prefix: str = ""
     semantic_use_fuzzy: bool = True
@@ -52,6 +58,9 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = ""
 
+    # CSV loaded by the first-start setup when the expert asks for sample data; empty = not available.
+    sample_diagnostics_csv: str = ""
+
     cors_origins: str = "http://localhost:5173"
     log_level: str = "INFO"
 
@@ -59,16 +68,26 @@ class Settings(BaseSettings):
     app_port: int = 8000
     app_reload: bool = False
 
+    @model_validator(mode="after")
+    def _mysql_needs_a_user(self) -> Self:
+        """Requires the MySQL user only when MySQL is the selected backend."""
+        if self.db_backend == "mysql" and not self.db_user:
+            raise ValueError("DB_USER is required when DB_BACKEND=mysql")
+        return self
+
     def database_url(self, database_name: str | None = None) -> URL:
         """Builds the SQLAlchemy connection URL.
 
         Args:
-            database_name: Database to connect to. Defaults to ``db_name``;
-                the test suite passes ``db_test_name``.
+            database_name: MySQL database to connect to. Defaults to ``db_name``;
+                the test suite passes ``db_test_name``. Ignored with SQLite, where
+                the database is the file in ``sqlite_path``.
 
         Returns:
             A URL object, which escapes special characters in the password.
         """
+        if self.db_backend == "sqlite":
+            return URL.create(drivername="sqlite+pysqlite", database=self.sqlite_path)
         return URL.create(
             drivername="mysql+pymysql",
             username=self.db_user,

@@ -5,8 +5,8 @@ import CsvImportPanel from "../components/CsvImportPanel.jsx";
 import DiagnosticForm from "../components/DiagnosticForm.jsx";
 import DiagnosticsTable from "../components/DiagnosticsTable.jsx";
 import TopBar from "../components/TopBar.jsx";
+import { useAuthGuard } from "../hooks/useAuthGuard.js";
 import {
-  ApiError,
   createDiagnostic,
   deleteDiagnostic,
   downloadImportTemplate,
@@ -42,21 +42,7 @@ export default function KnowledgeBasePage({ user, onLogout }) {
 
   const reload = useCallback(() => setReloadKey((key) => key + 1), []);
 
-  // Wraps an API call: an expired session goes back to login, any other error is rethrown to the caller.
-  const guarded = useCallback(
-    (call) =>
-      async (...args) => {
-        try {
-          return await call(...args);
-        } catch (err) {
-          if (err instanceof ApiError && err.status === 401) {
-            onLogout();
-          }
-          throw err;
-        }
-      },
-    [onLogout],
-  );
+  const guarded = useAuthGuard(onLogout);
 
   useEffect(() => {
     let ignore = false;

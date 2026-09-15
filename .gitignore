@@ -1,7 +1,11 @@
 # Environment
 venv/
 .venv/
+.venv-export/
 .env
+
+# Exported ONNX model (hundreds of MB, rebuilt with backend/scripts/export_onnx_model.py)
+backend/models/
 
 # Frontend dependencies
 node_modules/
@@ -36,6 +40,7 @@ app/logs/
 # Build / packaging
 build/
 dist/
+packaging/windows/output/
 *.egg-info/
 .eggs/
 

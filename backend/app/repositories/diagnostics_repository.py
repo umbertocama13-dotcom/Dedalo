@@ -5,8 +5,10 @@ are not caught here: they propagate as sqlalchemy.exc.IntegrityError and the ser
 layer validates the context before writing.
 
 Update/delete functions return ``rowcount > 0``. The SQLAlchemy PyMySQL dialect
-enables MySQL's FOUND_ROWS flag, so rowcount counts *matched* rows: an update
-that sets identical values still returns True instead of looking like a 404.
+enables MySQL's FOUND_ROWS flag, and SQLite always counts matched rows, so an
+update that sets identical values still returns True instead of looking like a 404.
+
+The SQL is shared by MySQL and SQLite: no dialect-specific syntax is used.
 """
 
 from typing import Any
@@ -93,9 +95,10 @@ def list_diagnostics(
         conditions.append("d.cycle_phase_id = :cycle_phase_id")
         params["cycle_phase_id"] = cycle_phase_id
     if search:
+        # An explicit ESCAPE character: MySQL defaults to backslash, SQLite has no default.
         conditions.append(
-            "(d.symptom_description LIKE :pattern OR d.affected_component LIKE :pattern "
-            " OR d.probable_cause LIKE :pattern OR d.recommended_solution LIKE :pattern)"
+            "(d.symptom_description LIKE :pattern ESCAPE '!' OR d.affected_component LIKE :pattern ESCAPE '!' "
+            " OR d.probable_cause LIKE :pattern ESCAPE '!' OR d.recommended_solution LIKE :pattern ESCAPE '!')"
         )
         params["pattern"] = f"%{_escape_like(search)}%"
 
@@ -197,7 +200,8 @@ def update_diagnostic(
             "UPDATE diagnostics SET symptom_description = :symptom_description, "
             "affected_component = :affected_component, probable_cause = :probable_cause, "
             "recommended_solution = :recommended_solution, family_id = :family_id, "
-            "cycle_phase_id = :cycle_phase_id WHERE id = :diagnostic_id"
+            # Set explicitly: SQLite has no ON UPDATE CURRENT_TIMESTAMP.
+            "cycle_phase_id = :cycle_phase_id, updated_at = CURRENT_TIMESTAMP WHERE id = :diagnostic_id"
         ),
         {
             "diagnostic_id": diagnostic_id,
@@ -235,6 +239,6 @@ def _escape_like(value: str) -> str:
         value: Raw search text.
 
     Returns:
-        The text with backslash, % and _ escaped with MySQL's default escape character.
+        The text with "!", "%" and "_" escaped with "!", the ESCAPE character of the query.
     """
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return value.replace("!", "!!").replace("%", "!%").replace("_", "!_")

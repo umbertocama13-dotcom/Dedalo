@@ -105,6 +105,27 @@ export function getCurrentUser() {
   return request("/auth/me");
 }
 
+/** Whether this installation still needs its first expert (public). */
+export function getSetupStatus() {
+  return request("/setup/status");
+}
+
+/** Creates the first expert; the backend refuses it (409) once any user exists. */
+export function runSetup({ username, password, loadSampleDiagnostics }) {
+  return request("/setup", {
+    method: "POST",
+    json: { username, password, load_sample_diagnostics: loadSampleDiagnostics },
+  });
+}
+
+export function listUsers() {
+  return request("/users");
+}
+
+export function createUser(user) {
+  return request("/users", { method: "POST", json: user });
+}
+
 export function getFamilies() {
   return request("/families");
 }
