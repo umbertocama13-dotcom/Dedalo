@@ -27,6 +27,7 @@ from app.config import Settings, get_settings
 from app.db import create_db_engine
 from app.repositories import diagnostics_repository
 from app.services.embeddings.embedding_cache import EmbeddingCache
+from app.services.embeddings.factory import create_embedder
 from app.services.embeddings.sentence_transformer_embedder import SentenceTransformerEmbedder
 from app.services.matching.base import Matcher, MatchCandidate, MatchResult
 from app.services.matching.fuzzy_matcher import FuzzyMatcher
@@ -220,6 +221,12 @@ def main() -> None:
     parser.add_argument("--models", nargs="+", default=[settings.embedding_model])
     parser.add_argument("--top-k", type=int, default=settings.max_candidates)
     parser.add_argument("--details", action="store_true", help="print the scores of every query")
+    parser.add_argument(
+        "--embedding-backend",
+        choices=["sentence-transformers", "onnx"],
+        default="sentence-transformers",
+        help="onnx evaluates the exported model in ONNX_MODEL_DIR (the one used by the desktop app)",
+    )
     args = parser.parse_args()
 
     cases = json.loads(FIXTURE.read_text(encoding="utf-8"))["queries"]
@@ -232,19 +239,27 @@ def main() -> None:
         f"no_match {row['no_match']}, negation {row['negation']}"
     )
 
-    for model_name in args.models:
-        if model_name == settings.embedding_model:
-            prefixes = (settings.embedding_query_prefix, settings.embedding_document_prefix)
-        else:
-            prefixes = E5_PREFIXES if "e5" in model_name else ("", "")
-        cache = EmbeddingCache(SentenceTransformerEmbedder(model_name, *prefixes))
+    if args.embedding_backend == "onnx":
+        onnx_settings = settings.model_copy(update={"embedding_backend": "onnx"})
+        runs = [(f"{settings.embedding_model} (ONNX)", settings.embedding_model, create_embedder(onnx_settings))]
+    else:
+        runs = []
+        for model_name in args.models:
+            if model_name == settings.embedding_model:
+                prefixes = (settings.embedding_query_prefix, settings.embedding_document_prefix)
+            else:
+                prefixes = E5_PREFIXES if "e5" in model_name else ("", "")
+            runs.append((model_name, model_name, SentenceTransformerEmbedder(model_name, *prefixes)))
+
+    for label, model_name, embedder in runs:
+        cache = EmbeddingCache(embedder)
         cache.warm_up([candidate.symptom_description for group in candidates.values() for candidate in group])
 
         for use_fuzzy in (False, True):
             matcher = SemanticMatcher(cache, threshold=0.0, max_results=100, use_fuzzy=use_fuzzy)
             outcomes, ms_per_query = run_queries(matcher, cases, candidates)
             mode = "semantic+fuzzy" if use_fuzzy else "semantic"
-            print(f"\n{model_name} [{mode}] — {ms_per_query:.1f} ms/query")
+            print(f"\n{label} [{mode}] — {ms_per_query:.1f} ms/query")
             print_threshold_table(outcomes, args.top_k)
             if model_name == settings.embedding_model and use_fuzzy == settings.semantic_use_fuzzy:
                 print_tiers(outcomes, settings)
