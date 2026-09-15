@@ -3,9 +3,11 @@
 settings -> test_engine -> db_connection -> client (+ auth headers)
 settings -> test_engine -> app
 
-Fixtures that touch MySQL are only created when a test requests them, so pure unit
-tests (matchers, CSV, probabilities) run without a database. The app uses a fake
-embedder: the real model is loaded only by the tests marked "model".
+``settings`` is parametrized on the two database backends, so every test that
+touches the database runs once on MySQL and once on SQLite (test ids end with
+[mysql] / [sqlite]). Pure unit tests do not request it and run once.
+
+The app uses a fake embedder: the real model is loaded only by the tests marked "model".
 """
 
 from collections.abc import Iterator
@@ -20,18 +22,20 @@ from sqlalchemy import Connection, Engine
 
 from app.config import Settings, get_settings
 from app.db import create_db_engine, get_connection
+from app.db_init import run_sqlite_scripts
 from app.main import create_app
 from app.services.security import create_access_token
 from tests.fake_embedder import FakeEmbedder
 
 DATABASE_DIR = Path(__file__).resolve().parents[2] / "database"
+SEED_SCRIPTS = ("seed_catalog.sql", "seed.sql")
 
 EXPERT_ID = 1
 OPERATOR_ID = 2
 
 
-def _rebuild_test_database(settings: Settings) -> None:
-    """Recreates the test database from schema.sql and seed.sql.
+def _rebuild_mysql_test_database(settings: Settings) -> None:
+    """Recreates the MySQL test database from schema.sql and the seed files.
 
     Args:
         settings: Settings with credentials and the test database name.
@@ -56,7 +60,7 @@ def _rebuild_test_database(settings: Settings) -> None:
     )
     try:
         with connection.cursor() as cursor:
-            for sql_file in ("schema.sql", "seed.sql"):
+            for sql_file in ("schema.sql", *SEED_SCRIPTS):
                 cursor.execute((DATABASE_DIR / sql_file).read_text(encoding="utf-8"))
                 while cursor.nextset():
                     pass
@@ -65,11 +69,11 @@ def _rebuild_test_database(settings: Settings) -> None:
         connection.close()
 
 
-@pytest.fixture(scope="session")
-def settings() -> Settings:
+@pytest.fixture(scope="session", params=["mysql", "sqlite"])
+def settings(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory) -> Settings:
     # Tests never call a real AI backend, whatever the developer's .env says, and use the
     # calibrated conversation values, so a local tuning of .env cannot change their outcome.
-    return get_settings().model_copy(
+    base = get_settings().model_copy(
         update={
             "ai_provider": "none",
             "semantic_use_fuzzy": True,
@@ -80,15 +84,25 @@ def settings() -> Settings:
             "probability_unknown_score": 0.60,
             "max_candidates": 5,
             "max_llm_questions": 3,
+            "sample_diagnostics_csv": str(DATABASE_DIR / "sample_diagnostics.csv"),
         }
     )
+    if request.param == "sqlite":
+        # A fresh file in a pytest temporary folder: it can never be the desktop app's database.
+        sqlite_path = tmp_path_factory.mktemp("sqlite") / "dedalo_test.db"
+        return base.model_copy(update={"db_backend": "sqlite", "sqlite_path": str(sqlite_path)})
+    return base.model_copy(update={"db_backend": "mysql"})
 
 
 @pytest.fixture(scope="session")
 def test_engine(settings: Settings) -> Iterator[Engine]:
-    """Rebuilds the test database once per test session and yields an engine on it."""
-    _rebuild_test_database(settings)
-    engine = create_db_engine(settings, settings.db_test_name)
+    """Builds the test database once per backend and yields an engine on it."""
+    if settings.db_backend == "sqlite":
+        engine = create_db_engine(settings)
+        run_sqlite_scripts(engine, [DATABASE_DIR / "sqlite" / "schema.sql", *(DATABASE_DIR / name for name in SEED_SCRIPTS)])
+    else:
+        _rebuild_mysql_test_database(settings)
+        engine = create_db_engine(settings, settings.db_test_name)
     yield engine
     engine.dispose()
 
@@ -106,7 +120,7 @@ def db_connection(test_engine: Engine) -> Iterator[Connection]:
 
 @pytest.fixture(scope="session")
 def app(settings: Settings, test_engine: Engine) -> FastAPI:
-    """Application wired to the test database (requesting test_engine guarantees it was rebuilt)."""
+    """Application wired to the test database (requesting test_engine guarantees it was built)."""
     return create_app(settings, database_name=settings.db_test_name, embedder=FakeEmbedder())
 
 
