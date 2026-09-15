@@ -15,6 +15,7 @@ export default function TopBar({ user, onLogout }) {
       <nav className="nav">
         <NavLink to="/chat">Diagnosi</NavLink>
         {user.role === "expert" && <NavLink to="/knowledge-base">Knowledge base</NavLink>}
+        {user.role === "expert" && <NavLink to="/users">Utenti</NavLink>}
       </nav>
       <span className="user">
         {user.username} ({ROLE_LABELS[user.role] ?? user.role})
