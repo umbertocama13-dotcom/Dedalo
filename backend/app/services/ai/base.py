@@ -3,27 +3,22 @@
 The rest of the application only depends on AIProvider: switching between external
 API, local model or no AI at all is a configuration change (AI_PROVIDER in .env).
 
-AI is only used to pre-process the operator's text. Diagnoses always come from the
-database through the deterministic matcher, never from a model.
+A model never produces a diagnosis. It can only ask the operator a question or narrow
+the candidates already retrieved from the database, and the conversation service
+validates every answer before using it.
 """
 
+import json
 from abc import ABC, abstractmethod
+from typing import Any
 
-# Same limit as base_diagnostics.symptom_description (VARCHAR(500)): a longer output
-# cannot be a symptom sentence and usually means the model ignored the instructions.
-MAX_OUTPUT_LENGTH = 500
-
-NORMALIZE_SYMPTOM_PROMPT = (
-    "You normalize fault descriptions written by operators of an industrial production line. "
-    "Rewrite the operator's text as one short symptom sentence in Italian: fix typos, remove "
-    "filler words, keep every technical detail and any negation. "
-    "Do NOT add causes, solutions or details that are not in the text. "
-    "Reply with the sentence only."
-)
+# A question plus a list of ids fits in a few hundred characters: a much longer
+# answer usually means the model ignored the instructions.
+MAX_OUTPUT_LENGTH = 2000
 
 
 class AIProviderError(Exception):
-    """Raised when an AI backend is unreachable or returns an unusable answer.
+    """Raised when an AI backend is unreachable, disabled or returns an unusable answer.
 
     Messages never include request headers or raw response bodies, so secrets
     such as API keys cannot leak into logs.
@@ -33,47 +28,35 @@ class AIProviderError(Exception):
 class AIProvider(ABC):
     """Interface implemented by every AI backend."""
 
+    # False only for the no-op backend: the conversation then skips the model entirely.
+    enabled: bool = True
+
     @abstractmethod
-    def normalize_symptom(self, text: str) -> str:
-        """Rewrites free operator text as a clean symptom description.
+    def complete_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+        """Sends a chat conversation and returns the model answer as a JSON object.
 
         Args:
-            text: Symptom as typed by the operator.
+            messages: Chat messages with "role" (system, user, assistant) and "content".
 
         Returns:
-            The normalized symptom sentence.
+            The JSON object produced by the model, not yet validated against a schema.
 
         Raises:
-            AIProviderError: If the backend fails or its answer is unusable.
+            AIProviderError: If the backend fails, is disabled or its answer is not a JSON object.
         """
 
 
-def build_normalization_messages(text: str) -> list[dict[str, str]]:
-    """Builds the chat messages shared by all chat-based backends.
-
-    Args:
-        text: Symptom as typed by the operator.
-
-    Returns:
-        A system message with the instructions and a user message with the text.
-    """
-    return [
-        {"role": "system", "content": NORMALIZE_SYMPTOM_PROMPT},
-        {"role": "user", "content": text},
-    ]
-
-
-def clean_model_output(content: object) -> str:
-    """Validates and trims the text returned by a model.
+def parse_json_object(content: object) -> dict[str, Any]:
+    """Validates the text returned by a model and parses it as a JSON object.
 
     Args:
         content: Raw content extracted from the backend response.
 
     Returns:
-        The trimmed text.
+        The parsed object.
 
     Raises:
-        AIProviderError: If the content is not a string, is empty or is too long.
+        AIProviderError: If the content is not text, is empty, too long, not JSON or not an object.
     """
     if not isinstance(content, str):
         raise AIProviderError("model returned non-text content")
@@ -82,4 +65,10 @@ def clean_model_output(content: object) -> str:
         raise AIProviderError("model returned an empty answer")
     if len(cleaned) > MAX_OUTPUT_LENGTH:
         raise AIProviderError(f"model answer longer than {MAX_OUTPUT_LENGTH} characters")
-    return cleaned
+    try:
+        value = json.loads(cleaned)
+    except json.JSONDecodeError as error:
+        raise AIProviderError("model answer is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise AIProviderError("model answer is not a JSON object")
+    return value

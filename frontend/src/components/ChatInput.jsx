@@ -1,7 +1,7 @@
 import { useState } from "react";
 
-// Same limit as the backend (DiagnosisRequest.symptom).
-const MAX_SYMPTOM_LENGTH = 500;
+// Same limit as the backend (ChatMessage.content).
+const MAX_SYMPTOM_LENGTH = 1000;
 
 /**
  * Text box where the operator describes the symptom.

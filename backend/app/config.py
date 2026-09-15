@@ -2,6 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
@@ -29,9 +30,22 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 480
 
-    match_score_threshold: float = 80.0
+    # Defaults calibrated on tests/fixtures/operator_queries.json with scripts/evaluate_matching.py
+    # (numbers and alternatives in workflow_sviluppo.md).
+    embedding_model: str = "nickprock/sentence-bert-base-italian-xxl-uncased"
+    embedding_query_prefix: str = ""
+    embedding_document_prefix: str = ""
+    semantic_use_fuzzy: bool = True
+    semantic_recall_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
+    semantic_match_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
+    disambiguation_score_gap: float = Field(default=0.05, ge=0.0, le=1.0)
+    probability_temperature: float = Field(default=0.03, gt=0.0)
+    probability_unknown_score: float = Field(default=0.60, ge=0.0, le=1.0)
+    max_candidates: int = Field(default=5, ge=1)
+    max_llm_questions: int = Field(default=3, ge=0)
 
     ai_provider: Literal["none", "api", "local"] = "none"
+    ai_timeout_seconds: float = Field(default=30.0, gt=0.0)
     ai_api_url: str = ""
     ai_api_key: str = ""
     ai_api_model: str = ""

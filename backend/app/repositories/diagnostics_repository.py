@@ -1,8 +1,8 @@
-"""Data access for base_diagnostics and diagnostic_exceptions.
+"""Data access for the diagnostics table.
 
-Integrity errors (unknown foreign keys, duplicate exceptions) are not caught here:
-they propagate as sqlalchemy.exc.IntegrityError and the service layer maps them
-to HTTP status codes.
+Integrity errors (unknown foreign keys, phase of another family, phase without family)
+are not caught here: they propagate as sqlalchemy.exc.IntegrityError and the service
+layer validates the context before writing.
 
 Update/delete functions return ``rowcount > 0``. The SQLAlchemy PyMySQL dialect
 enables MySQL's FOUND_ROWS flag, so rowcount counts *matched* rows: an update
@@ -13,63 +13,100 @@ from typing import Any
 
 from sqlalchemy import Connection, text
 
-_BASE_COLUMNS = (
-    "id, symptom_description, affected_component, probable_cause, "
-    "recommended_solution, created_by, created_at, updated_at"
+# Family and phase names are joined in, so callers can show and export them without extra queries.
+_SELECT_DIAGNOSTICS = (
+    "SELECT d.id, d.symptom_description, d.affected_component, d.probable_cause, d.recommended_solution, "
+    "       d.family_id, f.family_name, d.cycle_phase_id, p.phase_number, p.phase_name, "
+    "       d.created_by, d.created_at, d.updated_at "
+    "FROM diagnostics d "
+    "LEFT JOIN product_families f ON f.id = d.family_id "
+    "LEFT JOIN cycle_phases p ON p.id = d.cycle_phase_id "
 )
-_EXCEPTION_COLUMNS = (
-    "id, base_diagnostic_id, family_id, cycle_phase_id, specific_cause, "
-    "specific_solution, created_by, created_at, updated_at"
-)
 
 
-def list_match_candidates(connection: Connection, family_id: int, cycle_phase_id: int) -> list[dict[str, Any]]:
-    """Loads every base diagnostic with its exception for the given context, if any.
+def list_candidates(connection: Connection, family_id: int, cycle_phase_id: int | None) -> list[dict[str, Any]]:
+    """Loads the diagnostics that apply to the operator's context.
 
-    The unique key (base_diagnostic_id, cycle_phase_id) guarantees the LEFT JOIN
-    matches at most one exception per diagnostic, so rows are never duplicated.
+    A row applies when its family is NULL (generic) or the selected one. When a phase
+    is selected, rows scoped to other phases are excluded; without a phase, every row
+    of the family applies, since the operator does not know where the fault is.
 
     Args:
         connection: Open database connection.
         family_id: Product family selected by the operator.
-        cycle_phase_id: Cycle phase selected by the operator.
+        cycle_phase_id: Cycle phase selected by the operator, or None if unknown.
 
     Returns:
-        One dict per base diagnostic; exception_id, specific_cause and
-        specific_solution are None when no exception applies.
+        One dict per diagnostic, with keys matching ``MatchCandidate``.
     """
     rows = connection.execute(
         text(
-            "SELECT b.id AS base_diagnostic_id, b.symptom_description, b.affected_component, "
-            "       b.probable_cause, b.recommended_solution, "
-            "       e.id AS exception_id, e.specific_cause, e.specific_solution "
-            "FROM base_diagnostics b "
-            "LEFT JOIN diagnostic_exceptions e "
-            "       ON e.base_diagnostic_id = b.id "
-            "      AND e.family_id = :family_id "
-            "      AND e.cycle_phase_id = :cycle_phase_id "
-            "ORDER BY b.id"
+            "SELECT d.id AS diagnostic_id, d.symptom_description, d.affected_component, "
+            "       d.probable_cause, d.recommended_solution, d.family_id, d.cycle_phase_id, "
+            "       p.phase_number, p.phase_name "
+            "FROM diagnostics d "
+            "LEFT JOIN cycle_phases p ON p.id = d.cycle_phase_id "
+            "WHERE (d.family_id IS NULL OR d.family_id = :family_id) "
+            "  AND (:cycle_phase_id IS NULL OR d.cycle_phase_id IS NULL OR d.cycle_phase_id = :cycle_phase_id) "
+            "ORDER BY d.id"
         ),
         {"family_id": family_id, "cycle_phase_id": cycle_phase_id},
     ).mappings().all()
     return [dict(row) for row in rows]
 
 
-def list_base_diagnostics(connection: Connection) -> list[dict[str, Any]]:
-    """Lists all base diagnostics.
+def list_symptom_descriptions(connection: Connection) -> list[str]:
+    """Lists every distinct symptom text, used to pre-compute embeddings at startup.
 
     Args:
         connection: Open database connection.
 
     Returns:
+        The distinct symptom descriptions.
+    """
+    return list(connection.execute(text("SELECT DISTINCT symptom_description FROM diagnostics")).scalars().all())
+
+
+def list_diagnostics(
+    connection: Connection,
+    family_id: int | None = None,
+    cycle_phase_id: int | None = None,
+    search: str | None = None,
+) -> list[dict[str, Any]]:
+    """Lists diagnostics with optional exact filters and a free-text search.
+
+    Args:
+        connection: Open database connection.
+        family_id: Only rows scoped to this family.
+        cycle_phase_id: Only rows scoped to this phase.
+        search: Substring searched in symptom, component, cause and solution.
+
+    Returns:
         Diagnostic rows as dicts, ordered by id.
     """
-    rows = connection.execute(text(f"SELECT {_BASE_COLUMNS} FROM base_diagnostics ORDER BY id")).mappings().all()
+    conditions: list[str] = []
+    params: dict[str, Any] = {}
+    if family_id is not None:
+        conditions.append("d.family_id = :family_id")
+        params["family_id"] = family_id
+    if cycle_phase_id is not None:
+        conditions.append("d.cycle_phase_id = :cycle_phase_id")
+        params["cycle_phase_id"] = cycle_phase_id
+    if search:
+        conditions.append(
+            "(d.symptom_description LIKE :pattern OR d.affected_component LIKE :pattern "
+            " OR d.probable_cause LIKE :pattern OR d.recommended_solution LIKE :pattern)"
+        )
+        params["pattern"] = f"%{_escape_like(search)}%"
+
+    # Only fixed SQL fragments are joined here; every user value travels as a bound parameter.
+    where = f"WHERE {' AND '.join(conditions)} " if conditions else ""
+    rows = connection.execute(text(f"{_SELECT_DIAGNOSTICS}{where}ORDER BY d.id"), params).mappings().all()
     return [dict(row) for row in rows]
 
 
-def get_base_diagnostic(connection: Connection, diagnostic_id: int) -> dict[str, Any] | None:
-    """Fetches a single base diagnostic.
+def get_diagnostic(connection: Connection, diagnostic_id: int) -> dict[str, Any] | None:
+    """Fetches a single diagnostic.
 
     Args:
         connection: Open database connection.
@@ -79,28 +116,31 @@ def get_base_diagnostic(connection: Connection, diagnostic_id: int) -> dict[str,
         The diagnostic row as a dict, or None if it does not exist.
     """
     row = connection.execute(
-        text(f"SELECT {_BASE_COLUMNS} FROM base_diagnostics WHERE id = :diagnostic_id"),
-        {"diagnostic_id": diagnostic_id},
+        text(f"{_SELECT_DIAGNOSTICS}WHERE d.id = :diagnostic_id"), {"diagnostic_id": diagnostic_id}
     ).mappings().first()
     return dict(row) if row else None
 
 
-def insert_base_diagnostic(
+def insert_diagnostic(
     connection: Connection,
     symptom_description: str,
     affected_component: str,
     probable_cause: str,
     recommended_solution: str,
+    family_id: int | None,
+    cycle_phase_id: int | None,
     created_by: int,
 ) -> int:
-    """Inserts a base diagnostic.
+    """Inserts a diagnostic.
 
     Args:
         connection: Open database connection.
         symptom_description: Symptom as reported on the line.
         affected_component: Component involved in the fault.
-        probable_cause: Generic cause of the fault.
-        recommended_solution: Generic corrective procedure.
+        probable_cause: Cause of the fault.
+        recommended_solution: Corrective procedure.
+        family_id: Family the row applies to, or None for every family.
+        cycle_phase_id: Phase the row applies to, or None for the whole family.
         created_by: Id of the expert creating the row.
 
     Returns:
@@ -108,47 +148,56 @@ def insert_base_diagnostic(
     """
     result = connection.execute(
         text(
-            "INSERT INTO base_diagnostics "
-            "(symptom_description, affected_component, probable_cause, recommended_solution, created_by) "
-            "VALUES (:symptom_description, :affected_component, :probable_cause, :recommended_solution, :created_by)"
+            "INSERT INTO diagnostics "
+            "(symptom_description, affected_component, probable_cause, recommended_solution, "
+            " family_id, cycle_phase_id, created_by) "
+            "VALUES (:symptom_description, :affected_component, :probable_cause, :recommended_solution, "
+            "        :family_id, :cycle_phase_id, :created_by)"
         ),
         {
             "symptom_description": symptom_description,
             "affected_component": affected_component,
             "probable_cause": probable_cause,
             "recommended_solution": recommended_solution,
+            "family_id": family_id,
+            "cycle_phase_id": cycle_phase_id,
             "created_by": created_by,
         },
     )
     return int(result.lastrowid)
 
 
-def update_base_diagnostic(
+def update_diagnostic(
     connection: Connection,
     diagnostic_id: int,
     symptom_description: str,
     affected_component: str,
     probable_cause: str,
     recommended_solution: str,
+    family_id: int | None,
+    cycle_phase_id: int | None,
 ) -> bool:
-    """Replaces the editable fields of a base diagnostic.
+    """Replaces the editable fields of a diagnostic.
 
     Args:
         connection: Open database connection.
         diagnostic_id: Primary key of the diagnostic.
         symptom_description: New symptom text.
         affected_component: New component.
-        probable_cause: New generic cause.
-        recommended_solution: New generic procedure.
+        probable_cause: New cause.
+        recommended_solution: New procedure.
+        family_id: New family, or None for every family.
+        cycle_phase_id: New phase, or None for the whole family.
 
     Returns:
         True if the diagnostic exists, False otherwise.
     """
     result = connection.execute(
         text(
-            "UPDATE base_diagnostics SET symptom_description = :symptom_description, "
+            "UPDATE diagnostics SET symptom_description = :symptom_description, "
             "affected_component = :affected_component, probable_cause = :probable_cause, "
-            "recommended_solution = :recommended_solution WHERE id = :diagnostic_id"
+            "recommended_solution = :recommended_solution, family_id = :family_id, "
+            "cycle_phase_id = :cycle_phase_id WHERE id = :diagnostic_id"
         ),
         {
             "diagnostic_id": diagnostic_id,
@@ -156,13 +205,15 @@ def update_base_diagnostic(
             "affected_component": affected_component,
             "probable_cause": probable_cause,
             "recommended_solution": recommended_solution,
+            "family_id": family_id,
+            "cycle_phase_id": cycle_phase_id,
         },
     )
     return result.rowcount > 0
 
 
-def delete_base_diagnostic(connection: Connection, diagnostic_id: int) -> bool:
-    """Deletes a base diagnostic; its exceptions are removed by ON DELETE CASCADE.
+def delete_diagnostic(connection: Connection, diagnostic_id: int) -> bool:
+    """Deletes a diagnostic.
 
     Args:
         connection: Open database connection.
@@ -172,140 +223,18 @@ def delete_base_diagnostic(connection: Connection, diagnostic_id: int) -> bool:
         True if a row was deleted, False if it did not exist.
     """
     result = connection.execute(
-        text("DELETE FROM base_diagnostics WHERE id = :diagnostic_id"),
-        {"diagnostic_id": diagnostic_id},
+        text("DELETE FROM diagnostics WHERE id = :diagnostic_id"), {"diagnostic_id": diagnostic_id}
     )
     return result.rowcount > 0
 
 
-def list_exceptions(connection: Connection, base_diagnostic_id: int) -> list[dict[str, Any]]:
-    """Lists the exceptions attached to a base diagnostic.
+def _escape_like(value: str) -> str:
+    """Escapes LIKE wildcards so a search for "50%" does not match everything.
 
     Args:
-        connection: Open database connection.
-        base_diagnostic_id: Diagnostic whose exceptions are requested.
+        value: Raw search text.
 
     Returns:
-        Exception rows as dicts, ordered by id.
+        The text with backslash, % and _ escaped with MySQL's default escape character.
     """
-    rows = connection.execute(
-        text(
-            f"SELECT {_EXCEPTION_COLUMNS} FROM diagnostic_exceptions "
-            "WHERE base_diagnostic_id = :base_diagnostic_id ORDER BY id"
-        ),
-        {"base_diagnostic_id": base_diagnostic_id},
-    ).mappings().all()
-    return [dict(row) for row in rows]
-
-
-def get_exception(connection: Connection, exception_id: int) -> dict[str, Any] | None:
-    """Fetches a single diagnostic exception.
-
-    Args:
-        connection: Open database connection.
-        exception_id: Primary key of the exception.
-
-    Returns:
-        The exception row as a dict, or None if it does not exist.
-    """
-    row = connection.execute(
-        text(f"SELECT {_EXCEPTION_COLUMNS} FROM diagnostic_exceptions WHERE id = :exception_id"),
-        {"exception_id": exception_id},
-    ).mappings().first()
-    return dict(row) if row else None
-
-
-def insert_exception(
-    connection: Connection,
-    base_diagnostic_id: int,
-    family_id: int,
-    cycle_phase_id: int,
-    specific_cause: str,
-    specific_solution: str,
-    created_by: int,
-) -> int:
-    """Inserts a context-specific override for a base diagnostic.
-
-    Args:
-        connection: Open database connection.
-        base_diagnostic_id: Diagnostic being overridden.
-        family_id: Product family the override applies to.
-        cycle_phase_id: Cycle phase the override applies to (must belong to family_id).
-        specific_cause: Cause valid in this context.
-        specific_solution: Procedure valid in this context.
-        created_by: Id of the expert creating the row.
-
-    Returns:
-        The id of the new exception.
-    """
-    result = connection.execute(
-        text(
-            "INSERT INTO diagnostic_exceptions "
-            "(base_diagnostic_id, family_id, cycle_phase_id, specific_cause, specific_solution, created_by) "
-            "VALUES (:base_diagnostic_id, :family_id, :cycle_phase_id, :specific_cause, :specific_solution, :created_by)"
-        ),
-        {
-            "base_diagnostic_id": base_diagnostic_id,
-            "family_id": family_id,
-            "cycle_phase_id": cycle_phase_id,
-            "specific_cause": specific_cause,
-            "specific_solution": specific_solution,
-            "created_by": created_by,
-        },
-    )
-    return int(result.lastrowid)
-
-
-def update_exception(
-    connection: Connection,
-    exception_id: int,
-    family_id: int,
-    cycle_phase_id: int,
-    specific_cause: str,
-    specific_solution: str,
-) -> bool:
-    """Replaces the editable fields of a diagnostic exception.
-
-    Args:
-        connection: Open database connection.
-        exception_id: Primary key of the exception.
-        family_id: New product family.
-        cycle_phase_id: New cycle phase (must belong to family_id).
-        specific_cause: New context-specific cause.
-        specific_solution: New context-specific procedure.
-
-    Returns:
-        True if the exception exists, False otherwise.
-    """
-    result = connection.execute(
-        text(
-            "UPDATE diagnostic_exceptions SET family_id = :family_id, cycle_phase_id = :cycle_phase_id, "
-            "specific_cause = :specific_cause, specific_solution = :specific_solution "
-            "WHERE id = :exception_id"
-        ),
-        {
-            "exception_id": exception_id,
-            "family_id": family_id,
-            "cycle_phase_id": cycle_phase_id,
-            "specific_cause": specific_cause,
-            "specific_solution": specific_solution,
-        },
-    )
-    return result.rowcount > 0
-
-
-def delete_exception(connection: Connection, exception_id: int) -> bool:
-    """Deletes a diagnostic exception.
-
-    Args:
-        connection: Open database connection.
-        exception_id: Primary key of the exception.
-
-    Returns:
-        True if a row was deleted, False if it did not exist.
-    """
-    result = connection.execute(
-        text("DELETE FROM diagnostic_exceptions WHERE id = :exception_id"),
-        {"exception_id": exception_id},
-    )
-    return result.rowcount > 0
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

@@ -1,13 +1,15 @@
+from typing import Any
+
 import httpx
 
-from app.services.ai.base import AIProvider, AIProviderError, build_normalization_messages, clean_model_output
+from app.services.ai.base import AIProvider, AIProviderError, parse_json_object
 
 
 class LocalAIProvider(AIProvider):
     """Provider for a model served by Ollama on the company's own infrastructure."""
 
     def __init__(self, base_url: str, model: str, client: httpx.Client | None = None, timeout: float = 30.0) -> None:
-        """Initializes the provider. No request is sent until normalize_symptom is called.
+        """Initializes the provider. No request is sent until complete_json is called.
 
         Args:
             base_url: Ollama server URL, e.g. http://localhost:11434.
@@ -19,23 +21,25 @@ class LocalAIProvider(AIProvider):
         self._model = model
         self._client = client or httpx.Client(timeout=timeout)
 
-    def normalize_symptom(self, text: str) -> str:
-        """Asks the local model to rewrite the symptom.
+    def complete_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+        """Sends the conversation to the local model in JSON mode.
 
         Args:
-            text: Symptom as typed by the operator.
+            messages: Chat messages with role and content.
 
         Returns:
-            The normalized symptom sentence.
+            The JSON object produced by the model.
 
         Raises:
             AIProviderError: If Ollama is unreachable, answers with an error or an unusable body.
         """
         payload = {
             "model": self._model,
-            "messages": build_normalization_messages(text),
+            "messages": messages,
             # Without stream=False Ollama answers with one JSON object per generated token.
             "stream": False,
+            # Constrains generation to valid JSON.
+            "format": "json",
             # Temperature 0 makes the output as repeatable as the model allows.
             "options": {"temperature": 0},
         }
@@ -49,4 +53,4 @@ class LocalAIProvider(AIProvider):
             raise AIProviderError(f"Ollama request failed: {type(error).__name__}") from error
         except (ValueError, KeyError, TypeError) as error:
             raise AIProviderError("Ollama returned an unexpected response body") from error
-        return clean_model_output(content)
+        return parse_json_object(content)

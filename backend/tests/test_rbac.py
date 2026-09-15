@@ -1,6 +1,7 @@
 """Role-based access control on every knowledge base endpoint.
 
-The core rule of the brief: an operator can consult, never write.
+The core rule of the brief: an operator can consult, never write. Export and import
+are expert-only too: the CSV is the whole knowledge base, and importing writes to it.
 """
 
 from typing import Any
@@ -9,109 +10,126 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Connection, text
 
+from app.services.csv_service import CSV_COLUMNS
+
 DIAGNOSTIC_BODY = {
     "symptom_description": "L'avvitatore non raggiunge la coppia",
     "affected_component": "Avvitatore elettrico",
     "probable_cause": "Inserto usurato.",
     "recommended_solution": "Sostituire l'inserto.",
 }
-EXCEPTION_BODY = {"family_id": 1, "cycle_phase_id": 1, "specific_cause": "Causa.", "specific_solution": "Soluzione."}
+IMPORT_FILE = ";".join(CSV_COLUMNS) + "\r\n;;;;Sintomo;Componente;Causa;Soluzione"
 
 WRITE_REQUESTS = [
-    pytest.param("POST", "/diagnostics", DIAGNOSTIC_BODY, 201, id="create-diagnostic"),
-    pytest.param("PUT", "/diagnostics/1", DIAGNOSTIC_BODY, 200, id="update-diagnostic"),
-    pytest.param("DELETE", "/diagnostics/1", None, 200, id="delete-diagnostic"),
-    pytest.param("POST", "/diagnostics/3/exceptions", EXCEPTION_BODY, 201, id="create-exception"),
-    pytest.param("PUT", "/diagnostics/3/exceptions/1", EXCEPTION_BODY, 200, id="update-exception"),
-    pytest.param("DELETE", "/diagnostics/3/exceptions/1", None, 200, id="delete-exception"),
+    pytest.param("POST", "/diagnostics", {"json": DIAGNOSTIC_BODY}, 201, id="create"),
+    pytest.param("PUT", "/diagnostics/1", {"json": DIAGNOSTIC_BODY}, 200, id="update"),
+    pytest.param("DELETE", "/diagnostics/1", {}, 200, id="delete"),
+    pytest.param(
+        "POST",
+        "/diagnostics/import?dry_run=false",
+        {"files": {"file": ("kb.csv", IMPORT_FILE.encode(), "text/csv")}},
+        200,
+        id="import",
+    ),
+]
+
+EXPERT_ONLY_READS = [
+    pytest.param("GET", "/diagnostics/export", id="export"),
+    pytest.param("GET", "/diagnostics/import-template", id="template"),
 ]
 
 READ_REQUESTS = [
-    pytest.param("GET", "/families", None, id="families"),
-    pytest.param("GET", "/families/1/phases", None, id="phases"),
-    pytest.param("GET", "/diagnostics", None, id="list-diagnostics"),
-    pytest.param("GET", "/diagnostics/1", None, id="get-diagnostic"),
-    pytest.param("GET", "/diagnostics/3/exceptions", None, id="list-exceptions"),
+    pytest.param("GET", "/families", {}, id="families"),
+    pytest.param("GET", "/families/1/phases", {}, id="phases"),
+    pytest.param("GET", "/diagnostics", {}, id="list-diagnostics"),
+    pytest.param("GET", "/diagnostics/1", {}, id="get-diagnostic"),
     pytest.param(
         "POST",
         "/diagnosis",
-        {"symptom": "Il nastro trasportatore si ferma a intermittenza", "family_id": 1, "cycle_phase_id": 1},
+        {"json": {"family_id": 1, "messages": [{"role": "operator", "content": "Il nastro trasportatore si ferma a intermittenza"}]}},
         id="diagnosis",
     ),
 ]
 
 
-def knowledge_base_snapshot(connection: Connection) -> tuple[list[Any], list[Any]]:
-    """Returns every row of the knowledge base tables, to prove nothing changed."""
-    diagnostics = connection.execute(text("SELECT * FROM base_diagnostics ORDER BY id")).all()
-    exceptions = connection.execute(text("SELECT * FROM diagnostic_exceptions ORDER BY id")).all()
-    return list(diagnostics), list(exceptions)
+def knowledge_base_snapshot(connection: Connection) -> list[Any]:
+    """Returns every row of the knowledge base, to prove nothing changed."""
+    return list(connection.execute(text("SELECT * FROM diagnostics ORDER BY id")).all())
 
 
-# --- Writes ---------------------------------------------------------------------
+# --- Writes ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("method", "path", "body", "expert_status"), WRITE_REQUESTS)
+@pytest.mark.parametrize(("method", "path", "payload", "expert_status"), WRITE_REQUESTS)
 def test_operator_cannot_write_and_nothing_changes(
     client: TestClient,
     operator_headers: dict[str, str],
     db_connection: Connection,
     method: str,
     path: str,
-    body: dict[str, Any] | None,
+    payload: dict[str, Any],
     expert_status: int,
 ) -> None:
     before = knowledge_base_snapshot(db_connection)
 
-    response = client.request(method, path, json=body, headers=operator_headers)
+    response = client.request(method, path, headers=operator_headers, **payload)
 
     assert response.status_code == 403
     assert knowledge_base_snapshot(db_connection) == before
 
 
-@pytest.mark.parametrize(("method", "path", "body", "expert_status"), WRITE_REQUESTS)
+@pytest.mark.parametrize(("method", "path", "payload", "expert_status"), WRITE_REQUESTS)
 def test_anonymous_cannot_write(
-    client: TestClient, method: str, path: str, body: dict[str, Any] | None, expert_status: int
+    client: TestClient, method: str, path: str, payload: dict[str, Any], expert_status: int
 ) -> None:
-    assert client.request(method, path, json=body).status_code == 401
+    assert client.request(method, path, **payload).status_code == 401
 
 
-@pytest.mark.parametrize(("method", "path", "body", "expert_status"), WRITE_REQUESTS)
+@pytest.mark.parametrize(("method", "path", "payload", "expert_status"), WRITE_REQUESTS)
 def test_expert_can_write(
     client: TestClient,
     expert_headers: dict[str, str],
     method: str,
     path: str,
-    body: dict[str, Any] | None,
+    payload: dict[str, Any],
     expert_status: int,
 ) -> None:
-    assert client.request(method, path, json=body, headers=expert_headers).status_code == expert_status
+    assert client.request(method, path, headers=expert_headers, **payload).status_code == expert_status
 
 
-# --- Reads ----------------------------------------------------------------------
+# --- Reads ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("method", "path"), EXPERT_ONLY_READS)
+def test_export_and_template_are_expert_only(
+    client: TestClient, expert_headers: dict[str, str], operator_headers: dict[str, str], method: str, path: str
+) -> None:
+    assert client.request(method, path, headers=operator_headers).status_code == 403
+    assert client.request(method, path).status_code == 401
+    assert client.request(method, path, headers=expert_headers).status_code == 200
 
 
 @pytest.mark.parametrize("role_headers", ["operator_headers", "expert_headers"])
-@pytest.mark.parametrize(("method", "path", "body"), READ_REQUESTS)
+@pytest.mark.parametrize(("method", "path", "payload"), READ_REQUESTS)
 def test_every_role_can_read(
     client: TestClient,
     request: pytest.FixtureRequest,
     role_headers: str,
     method: str,
     path: str,
-    body: dict[str, Any] | None,
+    payload: dict[str, Any],
 ) -> None:
     headers = request.getfixturevalue(role_headers)
 
-    assert client.request(method, path, json=body, headers=headers).status_code == 200
+    assert client.request(method, path, headers=headers, **payload).status_code == 200
 
 
-@pytest.mark.parametrize(("method", "path", "body"), READ_REQUESTS)
-def test_anonymous_cannot_read(client: TestClient, method: str, path: str, body: dict[str, Any] | None) -> None:
-    assert client.request(method, path, json=body).status_code == 401
+@pytest.mark.parametrize(("method", "path", "payload"), READ_REQUESTS)
+def test_anonymous_cannot_read(client: TestClient, method: str, path: str, payload: dict[str, Any]) -> None:
+    assert client.request(method, path, **payload).status_code == 401
 
 
-# --- Role changes take effect immediately ----------------------------------------
+# --- Role changes take effect immediately ---------------------------------------------
 
 
 def test_promoted_operator_can_write_with_the_same_token(

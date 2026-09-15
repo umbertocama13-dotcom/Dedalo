@@ -30,11 +30,18 @@ def get_ai_provider(settings: Settings) -> AIProvider:
     if settings.ai_provider == "api":
         _require(settings, "ai_api_url", "ai_api_key", "ai_api_model")
         logger.warning("AI_PROVIDER=api: operator text will be sent to %s, outside the company network", settings.ai_api_url)
-        return ApiAIProvider(api_url=settings.ai_api_url, api_key=settings.ai_api_key, model=settings.ai_api_model)
+        return ApiAIProvider(
+            api_url=settings.ai_api_url,
+            api_key=settings.ai_api_key,
+            model=settings.ai_api_model,
+            timeout=settings.ai_timeout_seconds,
+        )
 
     if settings.ai_provider == "local":
         _require(settings, "ollama_base_url", "ollama_model")
-        return LocalAIProvider(base_url=settings.ollama_base_url, model=settings.ollama_model)
+        return LocalAIProvider(
+            base_url=settings.ollama_base_url, model=settings.ollama_model, timeout=settings.ai_timeout_seconds
+        )
 
     raise ValueError(f"Unknown AI_PROVIDER '{settings.ai_provider}': expected none, api or local")
 

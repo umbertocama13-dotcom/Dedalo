@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.dependencies import AppAIProvider, AppMatcher, CurrentUser, DbConnection
+from app.dependencies import AppAIProvider, AppMatcher, AppSettings, CurrentUser, DbConnection
 from app.schemas.diagnosis import DiagnosisRequest, DiagnosisResponse
 from app.services import diagnosis_service
 
@@ -14,9 +14,10 @@ def diagnose(
     connection: DbConnection,
     matcher: AppMatcher,
     ai_provider: AppAIProvider,
+    settings: AppSettings,
 ) -> DiagnosisResponse:
-    """Matches a symptom against the knowledge base for a family and cycle phase.
+    """Answers one turn of the diagnosis conversation.
 
     Always 200 when the request is valid: "no_match" is an expected answer, not an error.
     """
-    return diagnosis_service.diagnose(connection, body, matcher, ai_provider)
+    return diagnosis_service.diagnose(connection, body, matcher, ai_provider, settings)

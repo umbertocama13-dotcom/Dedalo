@@ -3,12 +3,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import ChatInput from "../components/ChatInput.jsx";
 import ChatMessageList from "../components/ChatMessageList.jsx";
 import ContextSelector from "../components/ContextSelector.jsx";
+import TopBar from "../components/TopBar.jsx";
 import { ApiError, diagnose, getFamilies, getPhases } from "../services/api.js";
 
-const ROLE_LABELS = { expert: "esperto", operator: "operatore" };
+// Same limit as the backend (DiagnosisRequest.messages).
+const MAX_MESSAGES = 20;
 
 /**
- * Chat screen: choose family and phase, describe a symptom, read the diagnosis.
+ * Diagnosis conversation: choose the family (and the phase if known), describe the symptom,
+ * read the hypotheses and answer the follow-up questions.
+ *
+ * The backend keeps no conversation state, so this page owns it: the messages sent to the
+ * API and the hypotheses excluded by the operator's choices.
  *
  * @param {{ user: { username: string, role: string }, onLogout: () => void }} props
  */
@@ -17,7 +23,11 @@ export default function ChatPage({ user, onLogout }) {
   const [phases, setPhases] = useState([]);
   const [familyId, setFamilyId] = useState(null);
   const [phaseId, setPhaseId] = useState(null);
+  // Displayed messages (operator bubbles, answers, errors).
   const [messages, setMessages] = useState([]);
+  // Messages sent to the API: operator texts and model questions only.
+  const [history, setHistory] = useState([]);
+  const [excludedIds, setExcludedIds] = useState([]);
   const [loading, setLoading] = useState(false);
   const nextMessageId = useRef(0);
 
@@ -38,6 +48,12 @@ export default function ChatPage({ user, onLogout }) {
     },
     [addMessage, onLogout],
   );
+
+  const resetConversation = useCallback(() => {
+    setMessages([]);
+    setHistory([]);
+    setExcludedIds([]);
+  }, []);
 
   useEffect(() => {
     getFamilies().then(setFamilies).catch(handleApiError);
@@ -61,24 +77,39 @@ export default function ChatPage({ user, onLogout }) {
     };
   }, [familyId, handleApiError]);
 
+  // A different context is a different conversation: previous hypotheses would not apply.
   function handleFamilyChange(id) {
     setFamilyId(id);
     setPhaseId(null);
     setPhases([]);
+    resetConversation();
   }
 
-  async function handleSend(symptom) {
+  function handlePhaseChange(id) {
+    setPhaseId(id);
+    resetConversation();
+  }
+
+  function contextLabel() {
     const family = families.find((item) => item.id === familyId);
     const phase = phases.find((item) => item.id === phaseId);
-    addMessage({
-      role: "operator",
-      text: symptom,
-      contextLabel: `${family.family_name} · fase ${phase.phase_number} ${phase.phase_name}`,
-    });
+    return `${family.family_name} · ${phase ? `fase ${phase.phase_number} ${phase.phase_name}` : "fase non indicata"}`;
+  }
 
+  async function runTurn(nextHistory, nextExcludedIds) {
     setLoading(true);
     try {
-      addMessage({ role: "assistant", response: await diagnose(symptom, familyId, phaseId) });
+      const response = await diagnose({
+        familyId,
+        cyclePhaseId: phaseId,
+        messages: nextHistory,
+        excludedIds: nextExcludedIds,
+      });
+      addMessage({ role: "assistant", response });
+      // A model question joins the history, so the model knows what it already asked.
+      if (response.follow_up?.type === "question") {
+        setHistory([...nextHistory, { role: "assistant", content: response.follow_up.question }]);
+      }
     } catch (error) {
       handleApiError(error);
     } finally {
@@ -86,19 +117,34 @@ export default function ChatPage({ user, onLogout }) {
     }
   }
 
-  const contextReady = familyId !== null && phaseId !== null;
+  function handleSend(text) {
+    addMessage({ role: "operator", text, contextLabel: history.length === 0 ? contextLabel() : undefined });
+    const nextHistory = [...history, { role: "operator", content: text }];
+    setHistory(nextHistory);
+    runTurn(nextHistory, excludedIds);
+  }
+
+  function handleSelect(label, idsToExclude) {
+    addMessage({ role: "operator", text: `Scelta: ${label}` });
+    const nextExcludedIds = [...new Set([...excludedIds, ...idsToExclude])];
+    setExcludedIds(nextExcludedIds);
+    runTurn(history, nextExcludedIds);
+  }
+
+  const contextReady = familyId !== null;
+  const conversationFull = history.length >= MAX_MESSAGES;
+  let placeholder = "Descrivi il sintomo osservato...";
+  if (!contextReady) {
+    placeholder = "Seleziona prima la famiglia di prodotto";
+  } else if (conversationFull) {
+    placeholder = "Conversazione troppo lunga: avviane una nuova";
+  } else if (history.length > 0) {
+    placeholder = "Rispondi o aggiungi dettagli sul sintomo...";
+  }
 
   return (
     <div className="chat-page">
-      <header className="topbar">
-        <span className="brand">Dedalo</span>
-        <span className="user">
-          {user.username} ({ROLE_LABELS[user.role] ?? user.role})
-        </span>
-        <button type="button" className="secondary" onClick={onLogout}>
-          Esci
-        </button>
-      </header>
+      <TopBar user={user} onLogout={onLogout} />
 
       <ContextSelector
         families={families}
@@ -106,16 +152,20 @@ export default function ChatPage({ user, onLogout }) {
         familyId={familyId}
         phaseId={phaseId}
         onFamilyChange={handleFamilyChange}
-        onPhaseChange={setPhaseId}
+        onPhaseChange={handlePhaseChange}
       />
 
-      <ChatMessageList messages={messages} loading={loading} />
+      {messages.length > 0 && (
+        <div className="conversation-actions">
+          <button type="button" className="secondary" onClick={resetConversation} disabled={loading}>
+            Nuova conversazione
+          </button>
+        </div>
+      )}
 
-      <ChatInput
-        onSend={handleSend}
-        disabled={!contextReady || loading}
-        placeholder={contextReady ? "Descrivi il sintomo osservato..." : "Seleziona prima famiglia e fase"}
-      />
+      <ChatMessageList messages={messages} loading={loading} onSelect={handleSelect} />
+
+      <ChatInput onSend={handleSend} disabled={!contextReady || loading || conversationFull} placeholder={placeholder} />
     </div>
   );
 }

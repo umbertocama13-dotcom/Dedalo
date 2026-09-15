@@ -55,6 +55,21 @@ def list_phases(connection: Connection, family_id: int) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def list_all_phases(connection: Connection) -> list[dict[str, Any]]:
+    """Lists the phases of every family, e.g. to resolve a whole CSV file with one query.
+
+    Args:
+        connection: Open database connection.
+
+    Returns:
+        Phase rows as dicts, ordered by family and phase number.
+    """
+    rows = connection.execute(
+        text("SELECT id, family_id, phase_number, phase_name FROM cycle_phases ORDER BY family_id, phase_number")
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
 def get_phase(connection: Connection, phase_id: int) -> dict[str, Any] | None:
     """Fetches a single cycle phase, including the family it belongs to.
 
