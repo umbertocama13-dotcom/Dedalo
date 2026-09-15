@@ -1,40 +1,43 @@
-"""Knowledge base management (expert only): base diagnostics and their exceptions.
+"""Knowledge base management: diagnostics CRUD and CSV export.
 
-Status codes: 404 for a resource in the path that does not exist (or a referenced
-family/phase that does not exist), 400 for an incoherent request, 409 for a duplicate.
+Status codes: 404 for a diagnostic in the path, or a referenced family/phase, that
+does not exist; 400 for an incoherent scope (phase without family or of another family).
 """
 
-from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy import Connection
-from sqlalchemy.exc import IntegrityError
 
-from app.repositories import diagnostics_repository
-from app.schemas.knowledge_base import BaseDiagnosticIn, BaseDiagnosticOut, ExceptionIn, ExceptionOut
+from app.repositories import catalog_repository, diagnostics_repository
+from app.schemas.knowledge_base import DiagnosticIn, DiagnosticOut
+from app.services import csv_service
 from app.services.catalog_service import validate_family_phase
 
-# MySQL/MariaDB error code for a UNIQUE constraint violation.
-MYSQL_DUPLICATE_ENTRY = 1062
 
-T = TypeVar("T")
-
-
-def list_diagnostics(connection: Connection) -> list[BaseDiagnosticOut]:
-    """Lists all base diagnostics.
+def list_diagnostics(
+    connection: Connection,
+    family_id: int | None = None,
+    cycle_phase_id: int | None = None,
+    search: str | None = None,
+) -> list[DiagnosticOut]:
+    """Lists diagnostics, optionally filtered.
 
     Args:
         connection: Open database connection.
+        family_id: Only rows scoped to this family.
+        cycle_phase_id: Only rows scoped to this phase.
+        search: Substring searched in symptom, component, cause and solution.
 
     Returns:
         The diagnostics ordered by id.
     """
-    return [BaseDiagnosticOut.model_validate(row) for row in diagnostics_repository.list_base_diagnostics(connection)]
+    rows = diagnostics_repository.list_diagnostics(connection, family_id, cycle_phase_id, search)
+    return [DiagnosticOut.model_validate(row) for row in rows]
 
 
-def get_diagnostic(connection: Connection, diagnostic_id: int) -> BaseDiagnosticOut:
-    """Fetches one base diagnostic.
+def get_diagnostic(connection: Connection, diagnostic_id: int) -> DiagnosticOut:
+    """Fetches one diagnostic.
 
     Args:
         connection: Open database connection.
@@ -46,14 +49,14 @@ def get_diagnostic(connection: Connection, diagnostic_id: int) -> BaseDiagnostic
     Raises:
         HTTPException: 404 if it does not exist.
     """
-    row = diagnostics_repository.get_base_diagnostic(connection, diagnostic_id)
+    row = diagnostics_repository.get_diagnostic(connection, diagnostic_id)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Diagnostic not found")
-    return BaseDiagnosticOut.model_validate(row)
+    return DiagnosticOut.model_validate(row)
 
 
-def create_diagnostic(connection: Connection, data: BaseDiagnosticIn, created_by: int) -> BaseDiagnosticOut:
-    """Creates a base diagnostic.
+def create_diagnostic(connection: Connection, data: DiagnosticIn, created_by: int) -> DiagnosticOut:
+    """Creates a diagnostic.
 
     Args:
         connection: Open database connection.
@@ -61,14 +64,18 @@ def create_diagnostic(connection: Connection, data: BaseDiagnosticIn, created_by
         created_by: Id of the expert creating it.
 
     Returns:
-        The stored diagnostic, including generated id and timestamps.
+        The stored diagnostic, including generated id, names and timestamps.
+
+    Raises:
+        HTTPException: 404 if family or phase do not exist, 400 if the phase is not part of the family.
     """
-    new_id = diagnostics_repository.insert_base_diagnostic(connection, **data.model_dump(), created_by=created_by)
+    validate_family_phase(connection, data.family_id, data.cycle_phase_id)
+    new_id = diagnostics_repository.insert_diagnostic(connection, **data.model_dump(), created_by=created_by)
     return get_diagnostic(connection, new_id)
 
 
-def update_diagnostic(connection: Connection, diagnostic_id: int, data: BaseDiagnosticIn) -> BaseDiagnosticOut:
-    """Replaces the fields of a base diagnostic.
+def update_diagnostic(connection: Connection, diagnostic_id: int, data: DiagnosticIn) -> DiagnosticOut:
+    """Replaces the fields of a diagnostic.
 
     Args:
         connection: Open database connection.
@@ -79,15 +86,17 @@ def update_diagnostic(connection: Connection, diagnostic_id: int, data: BaseDiag
         The updated diagnostic.
 
     Raises:
-        HTTPException: 404 if it does not exist.
+        HTTPException: 404 if the diagnostic, family or phase do not exist,
+            400 if the phase is not part of the family.
     """
-    if not diagnostics_repository.update_base_diagnostic(connection, diagnostic_id, **data.model_dump()):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Diagnostic not found")
+    get_diagnostic(connection, diagnostic_id)
+    validate_family_phase(connection, data.family_id, data.cycle_phase_id)
+    diagnostics_repository.update_diagnostic(connection, diagnostic_id, **data.model_dump())
     return get_diagnostic(connection, diagnostic_id)
 
 
 def delete_diagnostic(connection: Connection, diagnostic_id: int) -> None:
-    """Deletes a base diagnostic together with its exceptions.
+    """Deletes a diagnostic.
 
     Args:
         connection: Open database connection.
@@ -96,145 +105,65 @@ def delete_diagnostic(connection: Connection, diagnostic_id: int) -> None:
     Raises:
         HTTPException: 404 if it does not exist.
     """
-    if not diagnostics_repository.delete_base_diagnostic(connection, diagnostic_id):
+    if not diagnostics_repository.delete_diagnostic(connection, diagnostic_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Diagnostic not found")
 
 
-def list_exceptions(connection: Connection, diagnostic_id: int) -> list[ExceptionOut]:
-    """Lists the exceptions of a base diagnostic.
+def export_csv(connection: Connection) -> bytes:
+    """Exports every diagnostic in the CSV format accepted by the import.
 
     Args:
         connection: Open database connection.
-        diagnostic_id: Id of the diagnostic.
 
     Returns:
-        The exceptions ordered by id.
-
-    Raises:
-        HTTPException: 404 if the diagnostic does not exist.
+        The CSV file content.
     """
-    get_diagnostic(connection, diagnostic_id)
-    rows = diagnostics_repository.list_exceptions(connection, diagnostic_id)
-    return [ExceptionOut.model_validate(row) for row in rows]
+    return csv_service.export_diagnostics_csv(diagnostics_repository.list_diagnostics(connection))
 
 
-def create_exception(
-    connection: Connection, diagnostic_id: int, data: ExceptionIn, created_by: int
-) -> ExceptionOut:
-    """Creates a context-specific exception for a base diagnostic.
+def template_csv(connection: Connection) -> bytes:
+    """Builds a CSV template with one example row for each scope.
+
+    The examples use a real family and phase of the database when there is one, so
+    the template can be imported as it is to try the procedure.
 
     Args:
         connection: Open database connection.
-        diagnostic_id: Id of the diagnostic being overridden.
-        data: Validated exception fields.
-        created_by: Id of the expert creating it.
 
     Returns:
-        The stored exception.
-
-    Raises:
-        HTTPException: 404 if diagnostic, family or phase do not exist; 400 if the
-            phase is not part of the family; 409 if the diagnostic already has an
-            exception in that phase.
+        The CSV file content.
     """
-    get_diagnostic(connection, diagnostic_id)
-    validate_family_phase(connection, data.family_id, data.cycle_phase_id)
-    new_id = _guarded_write(
-        connection,
-        lambda: diagnostics_repository.insert_exception(
-            connection, diagnostic_id, **data.model_dump(), created_by=created_by
-        ),
-    )
-    return ExceptionOut.model_validate(diagnostics_repository.get_exception(connection, new_id))
-
-
-def update_exception(
-    connection: Connection, diagnostic_id: int, exception_id: int, data: ExceptionIn
-) -> ExceptionOut:
-    """Replaces the fields of an exception belonging to a diagnostic.
-
-    Args:
-        connection: Open database connection.
-        diagnostic_id: Id of the diagnostic owning the exception.
-        exception_id: Id of the exception.
-        data: New validated fields.
-
-    Returns:
-        The updated exception.
-
-    Raises:
-        HTTPException: 404 if the exception is not found under that diagnostic or
-            family/phase do not exist; 400 if the phase is not part of the family;
-            409 if the diagnostic already has another exception in that phase.
-    """
-    _get_owned_exception(connection, diagnostic_id, exception_id)
-    validate_family_phase(connection, data.family_id, data.cycle_phase_id)
-    _guarded_write(
-        connection,
-        lambda: diagnostics_repository.update_exception(connection, exception_id, **data.model_dump()),
-    )
-    return ExceptionOut.model_validate(diagnostics_repository.get_exception(connection, exception_id))
-
-
-def delete_exception(connection: Connection, diagnostic_id: int, exception_id: int) -> None:
-    """Deletes an exception belonging to a diagnostic.
-
-    Args:
-        connection: Open database connection.
-        diagnostic_id: Id of the diagnostic owning the exception.
-        exception_id: Id of the exception.
-
-    Raises:
-        HTTPException: 404 if the exception is not found under that diagnostic.
-    """
-    _get_owned_exception(connection, diagnostic_id, exception_id)
-    diagnostics_repository.delete_exception(connection, exception_id)
-
-
-def _get_owned_exception(connection: Connection, diagnostic_id: int, exception_id: int) -> dict[str, Any]:
-    """Fetches an exception only if it belongs to the given diagnostic.
-
-    Args:
-        connection: Open database connection.
-        diagnostic_id: Diagnostic id taken from the URL.
-        exception_id: Exception id taken from the URL.
-
-    Returns:
-        The exception row.
-
-    Raises:
-        HTTPException: 404 if missing or attached to another diagnostic.
-    """
-    row = diagnostics_repository.get_exception(connection, exception_id)
-    if row is None or row["base_diagnostic_id"] != diagnostic_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exception not found for this diagnostic")
-    return row
-
-
-def _guarded_write(connection: Connection, write: Callable[[], T]) -> T:
-    """Runs a write inside a savepoint and maps constraint violations to HTTP errors.
-
-    Args:
-        connection: Open database connection with an active transaction.
-        write: Function performing the write.
-
-    Returns:
-        Whatever the write returns.
-
-    Raises:
-        HTTPException: 409 for a duplicate, 400 for any other constraint violation.
-    """
-    try:
-        # The savepoint confines the rollback to this write: after a constraint error
-        # the request transaction is still usable instead of being left in a failed state.
-        with connection.begin_nested():
-            return write()
-    except IntegrityError as error:
-        if error.orig.args[0] == MYSQL_DUPLICATE_ENTRY:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="This diagnostic already has an exception for the selected cycle phase",
-            ) from error
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="The request violates a database constraint"
-        ) from error
+    rows: list[dict[str, Any]] = [
+        {
+            "symptom_description": "Esempio: la macchina non si avvia",
+            "affected_component": "Circuito di sicurezza",
+            "probable_cause": "Esempio di causa valida per tutte le famiglie.",
+            "recommended_solution": "Esempio di soluzione valida per tutte le famiglie.",
+        }
+    ]
+    families = catalog_repository.list_families(connection)
+    if families:
+        family = families[0]
+        rows.append(
+            {
+                "family_name": family["family_name"],
+                "symptom_description": "Esempio: la cella non completa il ciclo",
+                "affected_component": "Nastro trasportatore",
+                "probable_cause": "Esempio di causa valida per tutta la famiglia.",
+                "recommended_solution": "Esempio di soluzione valida per tutta la famiglia.",
+            }
+        )
+        phases = catalog_repository.list_phases(connection, family["id"])
+        if phases:
+            rows.append(
+                {
+                    "family_name": family["family_name"],
+                    "phase_number": phases[0]["phase_number"],
+                    "phase_name": phases[0]["phase_name"],
+                    "symptom_description": "Esempio: il pezzo non viene caricato",
+                    "affected_component": "Sensore presenza pezzo",
+                    "probable_cause": "Esempio di causa valida solo in questa fase.",
+                    "recommended_solution": "Esempio di soluzione valida solo in questa fase.",
+                }
+            )
+    return csv_service.export_diagnostics_csv(rows)

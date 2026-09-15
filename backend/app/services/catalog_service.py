@@ -34,19 +34,30 @@ def list_phases(connection: Connection, family_id: int) -> list[PhaseOut]:
     return [PhaseOut.model_validate(row) for row in catalog_repository.list_phases(connection, family_id)]
 
 
-def validate_family_phase(connection: Connection, family_id: int, cycle_phase_id: int) -> None:
-    """Checks that family and phase exist and that the phase belongs to the family.
+def validate_family_phase(connection: Connection, family_id: int | None, cycle_phase_id: int | None) -> None:
+    """Checks an optional family/phase context.
+
+    Both may be None (every family). A phase needs its family, and must belong to it.
 
     Args:
         connection: Open database connection.
-        family_id: Selected product family.
-        cycle_phase_id: Selected cycle phase.
+        family_id: Selected product family, or None.
+        cycle_phase_id: Selected cycle phase, or None.
 
     Raises:
         HTTPException: 404 if the family or the phase does not exist,
-            400 if the phase belongs to a different family.
+            400 if a phase is given without family or belongs to a different family.
     """
+    if family_id is None:
+        if cycle_phase_id is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="A cycle phase requires its product family"
+            )
+        return
+
     _ensure_family_exists(connection, family_id)
+    if cycle_phase_id is None:
+        return
     phase = catalog_repository.get_phase(connection, cycle_phase_id)
     if phase is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cycle phase not found")
