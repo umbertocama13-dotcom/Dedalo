@@ -4,11 +4,13 @@ Questo documento raccoglie **perché** il PoC è fatto così: decisioni di desig
 
 Per installazione, avvio e uso vedi il [README.md](README.md).
 
-Stato al 15/09/2026: **v2 completa**. Backend testato (338 test, copertura 99%), frontend verificato con build, lint e smoke test HTTP sul backend reale con il modello vero. La modalità LLM è testata solo con provider simulati: non è ancora stata provata con una chiave OpenAI reale.
+Stato al 15/09/2026: **v2 completa** e **app desktop per Windows pronta per la build**. Backend testato su MySQL e SQLite (604 test, compresi quelli con i modelli veri), launcher verificato su Linux con il modello ONNX e il server reale. L'installer Windows non è ancora stato costruito e provato su Windows. La modalità LLM è testata solo con provider simulati.
 
 ---
 
 ## Indice
+
+- [Parte 0 — App desktop per Windows](#parte-0--app-desktop-per-windows)
 
 - [Parte 1 — v2: ricerca semantica, conversazione, interfaccia esperto, CSV](#parte-1--v2)
   1. [Perché la v2](#1-perché-la-v2)
@@ -23,6 +25,121 @@ Stato al 15/09/2026: **v2 completa**. Backend testato (338 test, copertura 99%),
   10. [Limiti conosciuti](#10-limiti-conosciuti)
   11. [Migliorie possibili](#11-migliorie-possibili)
 - [Parte 2 — v1: decisioni ancora valide e storia](#parte-2--v1)
+
+---
+
+# Parte 0 — App desktop per Windows
+
+## D1. Obiettivo
+
+La v2 richiedeva MySQL, Python, Node e due terminali. L'obiettivo era un `Dedalo-Setup.exe` che crea un'icona sul desktop: doppio clic e l'app si apre, senza installare altro. Scelte fatte insieme: **PC singolo** con database integrato, **PyInstaller + pywebview**, **installer Inno Setup**, **ONNX Runtime** al posto di PyTorch, **primo esperto creato al primo avvio**, build su una VM Windows 10.
+
+## D2. Architettura
+
+```
+Dedalo.exe (PyInstaller onedir, senza console)
+ └─ desktop/launcher.py
+     1. lock di istanza singola          → seconda apertura: messaggio e uscita
+     2. %LOCALAPPDATA%\Dedalo            → dedalo.env (JWT casuale), logs\
+     3. primo avvio                      → dedalo.db creato da schema SQLite + catalogo
+     4. porta libera su 127.0.0.1         → uvicorn in un thread, create_app(static_dir=frontend)
+     5. finestra pywebview                → "Avvio in corso…" poi l'app
+     6. chiusura finestra                 → stop del server
+```
+
+Lo sviluppo non è cambiato: il desktop è una **seconda configurazione** dello stesso codice (`DB_BACKEND=sqlite`, `EMBEDDING_BACKEND=onnx`, `static_dir`).
+
+## D3. Decisioni
+
+### SQLite per il PC singolo, MySQL resta per server e sviluppo
+
+- **Quando serve MySQL invece di SQLite**: non per la quantità di dati (la knowledge base è di pochi MB) né per la velocità su un PC. Serve quando **più postazioni devono vedere la stessa knowledge base**. SQLite è un file senza server, e **non va messo su una cartella di rete condivisa**: su SMB il locking non è affidabile e il file si corrompe. Altri segnali: molte scritture contemporanee (SQLite ne accetta una alla volta), backup e permessi gestiti dall'IT, altri sistemi aziendali che leggono i dati.
+- **Stesso SQL per entrambi**. Differenze gestite:
+  - `ENUM` → `CHECK (role IN (...))`;
+  - collation `utf8mb4_unicode_ci` → `COLLATE NOCASE` su username e famiglie;
+  - `ON UPDATE CURRENT_TIMESTAMP` → `updated_at` impostato nell'`UPDATE` del repository;
+  - `LIKE` con `ESCAPE '!'` esplicito (MySQL usa la backslash di default, SQLite non ha un default);
+  - `PRAGMA foreign_keys=ON` a ogni connessione: **senza, SQLite ignora le foreign key**;
+  - `SET NAMES utf8mb4` tolto dai seed (non valido in SQLite): la connessione dei test imposta già il charset e il README usa `--default-character-set=utf8mb4`.
+- **Seed diviso**: `seed_catalog.sql` (famiglie e fasi, usato anche dal desktop) e `seed.sql` (utenti demo e diagnosi, solo sviluppo). Le diagnosi di esempio del desktop arrivano da `sample_diagnostics.csv`, generato dal seed; un test verifica che coincidano.
+- **Test su entrambi i database**: la fixture `settings` è parametrizzata, quindi ogni test d'integrazione gira su MySQL e su SQLite.
+
+*Scartato: MySQL installato sul PC.* Non sarebbe stato "clicca e parte".
+*Scartato per ora: server centrale + client.* È la strada per una knowledge base condivisa, ma richiede un server sempre acceso in rete.
+
+### pywebview invece di Electron
+
+Electron non esegue Python: servirebbe comunque PyInstaller per il backend, più Node ed electron-builder, più il codice per avviare e chiudere il processo Python. pywebview apre una finestra nativa con Edge WebView2 (già presente su Windows 10/11 aggiornati; l'installer lo installa se manca) nello stesso processo, con una sola toolchain e circa 150 MB in meno.
+
+### ONNX Runtime invece di PyTorch
+
+- `scripts/export_onnx_model.py` esporta il modello con `optimum-onnx` e **si ferma** se il modello usa moduli che `OnnxEmbedder` non replica (per esempio un layer `Dense` o un pooling diverso dalla media). Il modello italiano usa *mean pooling* e `max_seq_length` 512.
+- `OnnxEmbedder` replica sentence-transformers: tokenizer (`tokenizers`, senza PyTorch), ONNX Runtime, media dei vettori dei token pesata con l'attention mask, normalizzazione L2.
+- **Misure**:
+
+  | | PyTorch | ONNX |
+  |---|---|---|
+  | coseno tra i vettori delle due versioni (62 frasi) | — | ≥ 0,999 |
+  | frasi da trovare: prime 5 / prima / fasce sicura-incerta-nessuno | 47/48, 40/48, 39/8/1 | **identico** |
+  | frasi fuori tema: sicura / incerta / nessun dato | 0/6/3 | **identico** |
+  | NLL della probabilità (T 0,03, "nessuna" 0,60) | 0,403 | 0,398 |
+  | tempo per richiesta | ~56 ms | **~23 ms** |
+  | dipendenze | PyTorch ~1 GB | onnxruntime ~50 MB |
+
+  L'export segnala una differenza massima di 5·10⁻⁵ sui vettori dei singoli token (tolleranza dello strumento 10⁻⁵): è rumore numerico, e il test di parità conferma che non incide.
+- Le soglie calibrate restano valide: nessuna ricalibrazione.
+- *Scartata per ora: quantizzazione int8* (modello da ~110 MB invece di 422 MB). Cambierebbe i punteggi e richiederebbe una nuova calibrazione.
+
+### Installer con cartella (onedir) invece di un solo .exe
+
+Un eseguibile unico (onefile) dovrebbe estrarre centinaia di MB in una cartella temporanea **a ogni avvio**: decine di secondi di attesa e più segnalazioni degli antivirus. Con onedir l'installer copia i file una volta, e l'avvio richiede pochi secondi (misurato su Linux: server pronto in 3,3 s col modello ONNX).
+
+### Primo avvio senza credenziali preimpostate
+
+- L'installer non contiene utenti: chi apre l'app la prima volta crea l'**esperto**. `POST /setup` funziona **solo finché la tabella utenti è vuota**, poi risponde `409`.
+- Le diagnosi di esempio passano da `import_service`, cioè dalle stesse regole di un import CSV manuale.
+- L'esperto crea gli operatori dalla nuova pagina **Utenti** (`GET/POST /users`, solo expert, username unico senza distinguere maiuscole e minuscole).
+
+### Dettagli del launcher
+
+- **Porta libera scelta dal sistema** (bind sulla porta 0): una porta fissa potrebbe essere occupata da un altro programma. Il server ascolta **solo su 127.0.0.1**.
+- **Istanza singola** con un lock del sistema operativo su file (`msvcrt` su Windows, `fcntl` su Linux). Se l'app va in crash il sistema lo rilascia da solo: nessun lock orfano da togliere a mano.
+- **`sys.stdout`/`stderr` rediretti sul log**: in un eseguibile PyInstaller senza console valgono `None`, e uvicorn e il logging fallirebbero alla prima scrittura.
+- **Database creato in un file temporaneo e rinominato** solo a fine creazione: un primo avvio interrotto non lascia un database a metà.
+- **Impostazioni desktop forzate nel codice**: `dedalo.env` contiene solo ciò che l'utente può cambiare (chiave JWT, AI, soglie). Scrivere `DB_BACKEND=mysql` nel file non ha effetto, perché gli argomenti passati a `Settings` hanno la precedenza sul file.
+- **Download abilitati in WebView2** (`ALLOW_DOWNLOADS`): senza, export CSV e modello non funzionerebbero.
+- **Frontend servito dal backend** sullo stesso indirizzo (niente CORS): i file della build come file statici, e una route finale che restituisce `index.html` per le route di React Router (un ricaricamento di `/chat` non dà 404), con controllo che blocca i percorsi `../`.
+- **La disinstallazione non cancella i dati** in `%LOCALAPPDATA%\Dedalo`.
+
+## D4. Tentativi che non hanno funzionato
+
+| Tentativo | Cosa è successo | Come è stato risolto |
+|---|---|---|
+| `optimum-onnx` installato nel venv di sviluppo | pip ha retrocesso `transformers` (5.17 → 4.57) e `huggingface-hub`, incompatibili con sentence-transformers | versioni di sviluppo ripristinate; export in un venv separato (anche in `build.ps1`) |
+| Test "vincolo violato → `IntegrityError`" | su MySQL PyMySQL segnala la violazione di un `CHECK` (errore 3819) come `OperationalError` | il test accetta entrambe le classi: il database rifiuta comunque la riga |
+| `SET NAMES utf8mb4` nei seed condivisi | sintassi solo MySQL, SQLite la rifiuta | tolto dai seed; charset impostato dalla connessione e dal comando `mysql` |
+| SQLite in modalità WAL (più letture durante una scrittura) | provando il pacchetto: alla chiusura le ultime modifiche restavano in `dedalo.db-wal`, e una copia del solo `dedalo.db` conteneva 0 utenti e 0 diagnosi. Il backup indicato nella documentazione avrebbe perso tutto | `journal_mode=DELETE` (il default di SQLite): ogni scrittura confermata finisce subito in `dedalo.db`. Con un solo utente WAL non serviva; test di regressione sulla copia del file |
+| Prova del pacchetto che attendeva la riga con l'indirizzo | la `print` del launcher non svuotava il buffer: con l'output in pipe la riga non arrivava mai e la prova andava in timeout | `flush=True` sulle `print` del launcher |
+
+## D5. Limiti conosciuti
+
+1. **Knowledge base separata per ogni PC**: nessuna sincronizzazione, solo export/import CSV.
+2. **Famiglie e fasi** sono quelle del catalogo di esempio: non si gestiscono dall'interfaccia né dal CSV.
+3. **Utenti**: si possono solo creare. Niente modifica del ruolo, disattivazione o reset della password da interfaccia; una password dimenticata dell'unico esperto non si recupera.
+4. **Eseguibile non firmato**: SmartScreen mostra un avviso al primo avvio, e alcuni antivirus segnalano i pacchetti PyInstaller come falsi positivi.
+5. **Installer non ancora provato su Windows reale**: spec, launcher e server sono verificati su Linux, ma finestra WebView2, download e installer vanno controllati sulla VM (checklist in `packaging/windows/BUILD.md`).
+6. **Primo avvio in contemporanea**: due richieste di setup nello stesso istante potrebbero creare due esperti. Su un PC singolo c'è una sola schermata aperta.
+7. **SQLite**: `NOCASE` ignora maiuscole e minuscole solo per le lettere senza accento.
+8. **Porta locale**: mentre l'app è aperta, un altro utente dello stesso PC potrebbe raggiungere il server (serve comunque il login).
+9. **Nessun aggiornamento automatico**: una nuova versione va reinstallata sopra la precedente (i dati restano).
+10. Dimensione dell'installer dominata dal modello (422 MB).
+
+## D6. Migliorie possibili
+
+- Gestione di famiglie e fasi (interfaccia o CSV) e gestione completa degli utenti.
+- Modalità **server** con MySQL per più postazioni, riusando lo stesso codice.
+- Firma del codice, aggiornamento automatico, quantizzazione int8 del modello dopo una ricalibrazione.
+- Build automatica su GitHub Actions (runner Windows) invece della VM.
 
 ---
 

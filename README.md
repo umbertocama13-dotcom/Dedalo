@@ -22,6 +22,7 @@ Cause e soluzioni vengono **sempre dalla knowledge base**, mai generate. Se null
 - [Utenti di test](#utenti-di-test)
 - [Uso](#uso)
 - [Guida al CSV per l'esperto](#guida-al-csv-per-lesperto)
+- [App desktop per Windows](#app-desktop-per-windows)
 - [Configurazione](#configurazione)
 - [Assistente AI (opzionale)](#assistente-ai-opzionale)
 - [API](#api)
@@ -48,7 +49,7 @@ Cause e soluzioni vengono **sempre dalla knowledge base**, mai generate. Se null
 | Livello | Tecnologia |
 |---|---|
 | Backend | Python 3.11+ (sviluppato con 3.12), FastAPI, Uvicorn |
-| Database | MySQL 8.0.16+ / MariaDB 10.2+, accesso con SQLAlchemy Core + PyMySQL |
+| Database | MySQL 8.0.16+ / MariaDB 10.2+ (sviluppo, server) oppure SQLite (app desktop), accesso con SQLAlchemy Core |
 | Ricerca | sentence-transformers + PyTorch CPU, modello `nickprock/sentence-bert-base-italian-xxl-uncased` (licenza MIT), rapidfuzz |
 | Autenticazione | JWT (PyJWT) + bcrypt |
 | AI (opzionale) | httpx verso API compatibili OpenAI oppure Ollama |
@@ -60,8 +61,11 @@ Cause e soluzioni vengono **sempre dalla knowledge base**, mai generate. Se null
 ```
 dedalo/
 ├── database/
-│   ├── schema.sql                  # tabelle, vincoli, indici (ricrea tutto da zero)
-│   └── seed.sql                    # 3 famiglie, 36 diagnosi di esempio, utenti demo
+│   ├── schema.sql                  # MySQL: tabelle, vincoli, indici (ricrea tutto da zero)
+│   ├── sqlite/schema.sql           # SQLite: le stesse tabelle, per l'app desktop
+│   ├── seed_catalog.sql            # 3 famiglie e le loro fasi
+│   ├── seed.sql                    # utenti demo + 36 diagnosi (sviluppo e test)
+│   └── sample_diagnostics.csv      # le stesse 36 diagnosi, caricabili al primo avvio dell'app desktop
 ├── backend/
 │   ├── app/
 │   │   ├── main.py                 # create_app(): assembla l'applicazione
@@ -82,7 +86,9 @@ dedalo/
 │   │   │   └── ...
 │   │   ├── repositories/           # query SQL
 │   │   └── utils/                  # funzioni generiche copiate da function_archive
+│   ├── desktop/                    # launcher dell'app desktop (finestra, SQLite, primo avvio)
 │   ├── scripts/evaluate_matching.py  # calibrazione di modello e soglie
+│   ├── scripts/export_onnx_model.py  # esporta il modello in ONNX per l'app desktop
 │   ├── tests/                      # suite pytest + fixtures/operator_queries.json
 │   ├── run.py                      # unico punto di avvio del server
 │   ├── requirements.txt
@@ -98,6 +104,7 @@ dedalo/
 │   │   ├── App.jsx                 # routing e sessione
 │   │   └── main.jsx
 │   └── package.json
+├── packaging/windows/              # PyInstaller, Inno Setup, build.ps1 e guida BUILD.md
 ├── README.md
 └── workflow_sviluppo.md
 ```
@@ -130,9 +137,12 @@ FLUSH PRIVILEGES;
 ```
 
 ```bash
-mysql -u dedalo -p dedalo < database/schema.sql
-mysql -u dedalo -p dedalo < database/seed.sql
+mysql --default-character-set=utf8mb4 -u dedalo -p dedalo < database/schema.sql
+mysql --default-character-set=utf8mb4 -u dedalo -p dedalo < database/seed_catalog.sql
+mysql --default-character-set=utf8mb4 -u dedalo -p dedalo < database/seed.sql
 ```
+
+L'ordine conta: `seed.sql` usa le famiglie create da `seed_catalog.sql`. `--default-character-set=utf8mb4` evita che le lettere accentate vengano salvate male.
 
 > ⚠️ `schema.sql` **elimina e ricrea** tutte le tabelle: rieseguirlo cancella i dati. Il database `dedalo_test` non va popolato a mano: i test lo ricreano a ogni esecuzione.
 
@@ -171,7 +181,7 @@ npm ci
 La v2 sostituisce le tabelle `base_diagnostics` e `diagnostic_exceptions` con un'unica tabella `diagnostics`. Non esiste una migrazione automatica: il PoC contiene solo dati di esempio.
 
 1. Se hai inserito diagnosi a mano in v1, annotale prima di procedere.
-2. Ricrea il database: `mysql -u dedalo -p dedalo < database/schema.sql` e poi `seed.sql`.
+2. Ricrea il database con i tre comandi della sezione [Database](#1-database) (`schema.sql`, `seed_catalog.sql`, `seed.sql`).
 3. Installa le nuove dipendenze (sezione [Backend](#2-backend), comandi `pip`).
 4. In `backend/.env` elimina `MATCH_SCORE_THRESHOLD` (non più usata) e, se vuoi, copia le nuove variabili da `.env.example`. Senza, valgono i default calibrati.
 
@@ -289,6 +299,60 @@ id;family_name;phase_number;phase_name;symptom_description;affected_component;pr
 
 Le prime tre righe creano diagnosi con i tre ambiti (generica, famiglia, fase). L'ultima modifica la diagnosi 26.
 
+## App desktop per Windows
+
+Dedalo esiste anche come **app desktop per un singolo PC**: un installer `Dedalo-Setup.exe` crea l'icona sul desktop, e con un doppio clic si apre una finestra con l'app completa. Non servono MySQL, Python né Node sul PC dell'utente.
+
+| | Sviluppo / server | App desktop |
+|---|---|---|
+| Database | MySQL | SQLite, un file per PC |
+| Modello di embedding | PyTorch (sentence-transformers) | lo stesso modello in ONNX Runtime, senza PyTorch |
+| Interfaccia | browser, `npm run dev` | finestra nativa (Edge WebView2) |
+| Utenti | utenti demo del seed | il primo esperto si crea al primo avvio |
+| Knowledge base | condivisa da chi usa il server | **separata per ogni PC** (si trasferisce con il CSV) |
+
+### Costruire l'installer
+
+Va fatto su **Windows**: la guida con i comandi da copiare è in [packaging/windows/BUILD.md](packaging/windows/BUILD.md). In breve, sul PC Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -Version 2.0.0
+```
+
+### Primo avvio
+
+1. Doppio clic sull'icona **Dedalo**.
+2. Schermata *Benvenuto in Dedalo*: username e password del primo **esperto**, e se caricare le diagnosi di esempio.
+3. L'esperto crea gli account degli operatori dalla pagina **Utenti**.
+
+### Dove sono i dati
+
+| Cosa | Percorso |
+|---|---|
+| Knowledge base e utenti | `%LOCALAPPDATA%\Dedalo\dedalo.db` |
+| Configurazione | `%LOCALAPPDATA%\Dedalo\dedalo.env` |
+| Log | `%LOCALAPPDATA%\Dedalo\logs\dedalo.log` |
+
+- **Backup**: con Dedalo chiuso, copia `dedalo.db`.
+- **Assistente AI**: con Dedalo chiuso, apri `dedalo.env` e segui le istruzioni nel file (per esempio OpenAI).
+- **Disinstallazione**: rimuove il programma ma **non** la cartella dei dati, così la knowledge base non si perde per errore.
+
+### Provare l'app desktop su Linux
+
+Serve il modello esportato in ONNX e il frontend costruito in modalità desktop:
+
+```bash
+cd backend
+python3 -m venv .venv-export
+.venv-export/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+.venv-export/bin/pip install optimum-onnx onnxruntime
+.venv-export/bin/python scripts/export_onnx_model.py
+(cd ../frontend && npm run build -- --mode desktop)
+DEDALO_DATA_DIR=/tmp/dedalo-prova .venv/bin/python -m desktop --browser
+```
+
+Il venv di export è separato perché `optimum-onnx` richiede una versione di `transformers` incompatibile con quella di sviluppo. `--browser` apre l'app nel browser invece della finestra; `DEDALO_DATA_DIR` usa una cartella dati di prova.
+
 ## Configurazione
 
 ### Backend: `backend/.env`
@@ -301,9 +365,14 @@ Template commentato in [backend/.env.example](backend/.env.example). Le variabil
 | `DB_USER` / `DB_PASSWORD` | — (obbligatorie) | credenziali MySQL |
 | `DB_NAME` | `dedalo` | database dell'applicazione |
 | `DB_TEST_NAME` | `dedalo_test` | database dei test; **deve** essere diverso da `DB_NAME` |
+| `DB_BACKEND` | `mysql` | `mysql` oppure `sqlite` (l'app desktop lo imposta da sola) |
+| `SQLITE_PATH` | `dedalo.db` | file del database, solo con `DB_BACKEND=sqlite` |
 | `JWT_SECRET_KEY` | — (obbligatoria) | chiave di firma dei token |
 | `JWT_ALGORITHM` / `JWT_EXPIRE_MINUTES` | `HS256` / `480` | firma e durata del token |
+| `EMBEDDING_BACKEND` | `sentence-transformers` | `sentence-transformers` (PyTorch) oppure `onnx` (modello esportato) |
 | `EMBEDDING_MODEL` | `nickprock/sentence-bert-base-italian-xxl-uncased` | modello di embedding locale |
+| `ONNX_MODEL_DIR` | `backend/models/sentence-bert-base-italian-xxl-uncased` | cartella del modello esportato, solo con `EMBEDDING_BACKEND=onnx` |
+| `SAMPLE_DIAGNOSTICS_CSV` | vuota | CSV proposto come dati di esempio al primo avvio (vuota = opzione non disponibile) |
 | `EMBEDDING_QUERY_PREFIX` / `EMBEDDING_DOCUMENT_PREFIX` | vuote | prefissi richiesti da alcuni modelli (es. e5: `query: ` / `passage: `) |
 | `SEMANTIC_USE_FUZZY` | `true` | usa anche la somiglianza fuzzy (aiuta con i refusi) |
 | `SEMANTIC_RECALL_THRESHOLD` | `0.50` | sotto questo punteggio un'ipotesi non viene mostrata |
@@ -387,6 +456,10 @@ Documentazione interattiva su http://127.0.0.1:8000/docs. Tutti gli endpoint tra
 | GET | `/diagnostics/export` | expert | tutte le diagnosi in CSV |
 | GET | `/diagnostics/import-template` | expert | modello CSV con esempi |
 | POST | `/diagnostics/import?dry_run=true` | expert | import CSV (`multipart/form-data`, campo `file`); `dry_run=false` scrive |
+| GET | `/setup/status` | pubblico | `{"needs_setup": true}` se non esiste ancora nessun utente |
+| POST | `/setup` | pubblico, **solo senza utenti** | crea il primo esperto ed eventualmente carica le diagnosi di esempio |
+| GET | `/users` | expert | elenco utenti |
+| POST | `/users` | expert | crea un utente (`operator` o `expert`) |
 
 Richiesta di diagnosi. Il server non conserva la conversazione: il client invia ogni volta tutti i messaggi e gli id esclusi dalle scelte.
 
@@ -435,12 +508,13 @@ Risposta (abbreviata):
 | `401` | token mancante, scaduto o non valido |
 | `403` | ruolo insufficiente |
 | `404` | risorsa, famiglia o fase non trovata |
+| `409` | username già esistente, oppure primo avvio già completato |
 
 ## Test e calibrazione
 
 ### Backend
 
-I test usano `dedalo_test`, ricreato da `schema.sql` + `seed.sql` a ogni esecuzione; `dedalo` non viene mai toccato. L'app di test usa un embedder finto, quindi la suite è veloce. Solo i test marcati `model` caricano il modello vero.
+Ogni test che usa il database gira **due volte**: su MySQL (`dedalo_test`, ricreato a ogni esecuzione; `dedalo` non viene mai toccato) e su SQLite (un file temporaneo). Nel nome del test compare `[mysql]` o `[sqlite]`. L'app di test usa un embedder finto, quindi la suite è veloce. Solo i test marcati `model` caricano i modelli veri; quelli su ONNX vengono saltati finché il modello non è esportato.
 
 ```bash
 cd backend
@@ -485,6 +559,8 @@ npm run build
 | "Server non raggiungibile" nel frontend | backend spento, oppure `VITE_API_URL` sbagliato |
 | Errore CORS nel browser | aggiungi l'indirizzo del frontend a `CORS_ORIGINS` e riavvia |
 | `Unknown column` / `Table 'diagnostics' doesn't exist` | database ancora in schema v1: vedi [Aggiornamento da v1](#aggiornamento-da-v1) |
+| `Cannot add or update a child row` caricando `seed.sql` | carica prima `seed_catalog.sql` (vedi [Database](#1-database)) |
+| `ONNX model not found` | esporta il modello (vedi [Provare l'app desktop su Linux](#provare-lapp-desktop-su-linux)) oppure usa `EMBEDDING_BACKEND=sentence-transformers` |
 | `AI_PROVIDER=... requires these variables in .env` | imposta le variabili indicate oppure `AI_PROVIDER=none` |
 | Le risposte riportano "Assistente AI non disponibile" | provider irraggiungibile, lento (`AI_TIMEOUT_SECONDS`) o risposta non valida: il motivo è nel log del backend |
 | `DB_TEST_NAME must differ from DB_NAME` nei test | protezione voluta |
