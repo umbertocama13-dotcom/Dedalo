@@ -1,19 +1,21 @@
+from typing import Any
+
 import httpx
 
-from app.services.ai.base import AIProvider, AIProviderError, build_normalization_messages, clean_model_output
+from app.services.ai.base import AIProvider, AIProviderError, parse_json_object
 
 
 class ApiAIProvider(AIProvider):
     """Provider for an external OpenAI-compatible chat completions API.
 
-    Paid service: every call sends the operator's text outside the company network.
+    Paid service: every call sends the conversation outside the company network.
     Suitable for validating the PoC, not for production data.
     """
 
     def __init__(
         self, api_url: str, api_key: str, model: str, client: httpx.Client | None = None, timeout: float = 30.0
     ) -> None:
-        """Initializes the provider. No request is sent until normalize_symptom is called.
+        """Initializes the provider. No request is sent until complete_json is called.
 
         Args:
             api_url: Base URL of the API, e.g. https://api.openai.com/v1.
@@ -27,23 +29,25 @@ class ApiAIProvider(AIProvider):
         self._model = model
         self._client = client or httpx.Client(timeout=timeout)
 
-    def normalize_symptom(self, text: str) -> str:
-        """Asks the external model to rewrite the symptom.
+    def complete_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+        """Sends the conversation to the external model in JSON mode.
 
         Args:
-            text: Symptom as typed by the operator.
+            messages: Chat messages with role and content.
 
         Returns:
-            The normalized symptom sentence.
+            The JSON object produced by the model.
 
         Raises:
             AIProviderError: If the API is unreachable, rejects the request or returns an unusable body.
         """
         payload = {
             "model": self._model,
-            "messages": build_normalization_messages(text),
+            "messages": messages,
             # Temperature 0 makes the output as repeatable as the model allows.
             "temperature": 0,
+            # JSON mode: the API guarantees syntactically valid JSON (the schema is still checked by us).
+            "response_format": {"type": "json_object"},
         }
         try:
             response = self._client.post(self._url, json=payload, headers=self._headers)
@@ -56,4 +60,4 @@ class ApiAIProvider(AIProvider):
             raise AIProviderError(f"AI API request failed: {type(error).__name__}") from error
         except (ValueError, KeyError, IndexError, TypeError) as error:
             raise AIProviderError("AI API returned an unexpected response body") from error
-        return clean_model_output(content)
+        return parse_json_object(content)
