@@ -1,30 +1,35 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import Settings, get_settings
 from app.db import create_db_engine
 from app.logging_config import configure_logging
 from app.repositories import diagnostics_repository
-from app.routes import auth, catalog, diagnosis, knowledge_base
+from app.routes import auth, catalog, diagnosis, knowledge_base, setup, users
 from app.services.ai.factory import get_ai_provider
 from app.services.embeddings.base import Embedder
 from app.services.embeddings.embedding_cache import EmbeddingCache
-from app.services.embeddings.sentence_transformer_embedder import SentenceTransformerEmbedder
+from app.services.embeddings.factory import create_embedder
 from app.services.matching.semantic_matcher import SemanticMatcher
 
 logger = logging.getLogger(__name__)
 
 
 def create_app(
-    settings: Settings | None = None, database_name: str | None = None, embedder: Embedder | None = None
+    settings: Settings | None = None,
+    database_name: str | None = None,
+    embedder: Embedder | None = None,
+    static_dir: Path | None = None,
 ) -> FastAPI:
     """Builds and configures the FastAPI application.
 
@@ -34,8 +39,10 @@ def create_app(
     Args:
         settings: Settings to use; defaults to the ones read from the environment.
         database_name: Optional database override (the test suite uses the test DB).
-        embedder: Embedding backend; defaults to the model in EMBEDDING_MODEL.
+        embedder: Embedding backend; defaults to the one selected by EMBEDDING_BACKEND.
             Tests pass a lightweight fake instead of loading the model.
+        static_dir: Folder with the built React app (``npm run build``). When given, the
+            backend also serves the frontend from the same address (desktop app).
 
     Returns:
         The configured application.
@@ -48,9 +55,7 @@ def create_app(
     configure_logging(settings.log_level)
     ai_provider = get_ai_provider(settings)
     if embedder is None:
-        embedder = SentenceTransformerEmbedder(
-            settings.embedding_model, settings.embedding_query_prefix, settings.embedding_document_prefix
-        )
+        embedder = create_embedder(settings)
     embedding_cache = EmbeddingCache(embedder)
 
     @asynccontextmanager
@@ -82,10 +87,35 @@ def create_app(
     )
     app.add_exception_handler(RequestValidationError, _validation_error_handler)
 
-    for router in (auth.router, catalog.router, diagnosis.router, knowledge_base.router):
+    for router in (auth.router, catalog.router, diagnosis.router, knowledge_base.router, setup.router, users.router):
         app.include_router(router)
+    if static_dir is not None:
+        # Registered after the API routers, so an API path always wins over the catch-all.
+        _mount_frontend(app, static_dir)
 
     return app
+
+
+def _mount_frontend(app: FastAPI, static_dir: Path) -> None:
+    """Serves the built React app from the same origin as the API.
+
+    React Router handles paths such as /chat in the browser: a reload of that page asks the
+    server for /chat, which must answer with index.html instead of 404.
+
+    Args:
+        app: Application to extend.
+        static_dir: Folder produced by the Vite build (index.html, assets/).
+    """
+    root = static_dir.resolve()
+    app.mount("/assets", StaticFiles(directory=root / "assets"), name="assets")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    async def serve_frontend(path: str) -> FileResponse:
+        candidate = (root / path).resolve()
+        # Real files next to index.html (e.g. favicon.svg); the containment check blocks "../" paths.
+        if path and candidate.is_file() and candidate.is_relative_to(root):
+            return FileResponse(candidate)
+        return FileResponse(root / "index.html")
 
 
 def _warm_up_embeddings(app: FastAPI) -> None:
