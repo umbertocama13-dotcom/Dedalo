@@ -17,7 +17,7 @@ from app.db import get_connection
 from app.schemas.auth import UserOut
 from app.services import auth_service
 from app.services.ai.base import AIProvider
-from app.services.matching.fuzzy_matcher import Matcher
+from app.services.matching.base import Matcher
 
 # tokenUrl tells Swagger UI where its "Authorize" button sends username and password.
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
