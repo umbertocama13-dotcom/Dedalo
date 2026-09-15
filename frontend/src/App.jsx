@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 
 import ChatPage from "./pages/ChatPage.jsx";
+import KnowledgeBasePage from "./pages/KnowledgeBasePage.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
 import { getCurrentUser, getToken, logout } from "./services/api.js";
 
@@ -30,6 +31,13 @@ export default function App() {
     return <p className="loading-page">Verifica della sessione...</p>;
   }
 
+  let knowledgeBaseElement = <Navigate to="/login" replace />;
+  if (user) {
+    // Only a convenience for operators: the backend rejects their writes anyway.
+    knowledgeBaseElement =
+      user.role === "expert" ? <KnowledgeBasePage user={user} onLogout={handleLogout} /> : <Navigate to="/chat" replace />;
+  }
+
   return (
     <Routes>
       <Route path="/login" element={user ? <Navigate to="/chat" replace /> : <LoginPage onLogin={setUser} />} />
@@ -37,6 +45,7 @@ export default function App() {
         path="/chat"
         element={user ? <ChatPage user={user} onLogout={handleLogout} /> : <Navigate to="/login" replace />}
       />
+      <Route path="/knowledge-base" element={knowledgeBaseElement} />
       <Route path="*" element={<Navigate to={user ? "/chat" : "/login"} replace />} />
     </Routes>
   );
