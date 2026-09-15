@@ -4,7 +4,8 @@ settings -> test_engine -> db_connection -> client (+ auth headers)
 settings -> test_engine -> app
 
 Fixtures that touch MySQL are only created when a test requests them, so pure unit
-tests (e.g. the fuzzy matcher) run without a database.
+tests (matchers, CSV, probabilities) run without a database. The app uses a fake
+embedder: the real model is loaded only by the tests marked "model".
 """
 
 from collections.abc import Iterator
@@ -21,6 +22,7 @@ from app.config import Settings, get_settings
 from app.db import create_db_engine, get_connection
 from app.main import create_app
 from app.services.security import create_access_token
+from tests.fake_embedder import FakeEmbedder
 
 DATABASE_DIR = Path(__file__).resolve().parents[2] / "database"
 
@@ -65,8 +67,21 @@ def _rebuild_test_database(settings: Settings) -> None:
 
 @pytest.fixture(scope="session")
 def settings() -> Settings:
-    # Tests never call a real AI backend, whatever the developer's .env says.
-    return get_settings().model_copy(update={"ai_provider": "none"})
+    # Tests never call a real AI backend, whatever the developer's .env says, and use the
+    # calibrated conversation values, so a local tuning of .env cannot change their outcome.
+    return get_settings().model_copy(
+        update={
+            "ai_provider": "none",
+            "semantic_use_fuzzy": True,
+            "semantic_recall_threshold": 0.50,
+            "semantic_match_threshold": 0.65,
+            "disambiguation_score_gap": 0.05,
+            "probability_temperature": 0.03,
+            "probability_unknown_score": 0.60,
+            "max_candidates": 5,
+            "max_llm_questions": 3,
+        }
+    )
 
 
 @pytest.fixture(scope="session")
@@ -92,7 +107,7 @@ def db_connection(test_engine: Engine) -> Iterator[Connection]:
 @pytest.fixture(scope="session")
 def app(settings: Settings, test_engine: Engine) -> FastAPI:
     """Application wired to the test database (requesting test_engine guarantees it was rebuilt)."""
-    return create_app(settings, database_name=settings.db_test_name)
+    return create_app(settings, database_name=settings.db_test_name, embedder=FakeEmbedder())
 
 
 @pytest.fixture
