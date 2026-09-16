@@ -514,13 +514,20 @@ Risposta (abbreviata):
 
 ### Backend
 
-Ogni test che usa il database gira **due volte**: su MySQL (`dedalo_test`, ricreato a ogni esecuzione; `dedalo` non viene mai toccato) e su SQLite (un file temporaneo). Nel nome del test compare `[mysql]` o `[sqlite]`. L'app di test usa un embedder finto, quindi la suite è veloce. Solo i test marcati `model` caricano i modelli veri; quelli su ONNX vengono saltati finché il modello non è esportato.
+Ogni test che usa il database gira **due volte**: su MySQL (`dedalo_test`, ricreato a ogni esecuzione; `dedalo` non viene mai toccato) e su SQLite (un file temporaneo). Nel nome del test compare `[mysql]` o `[sqlite]`. L'app di test usa un embedder finto, quindi la suite è veloce.
+
+I 15 test marcati `model` caricano i modelli veri (PyTorch e ONNX insieme: picco misurato di circa 1,5 GB di RAM, durata circa 1 minuto). Lanciati mentre altri programmi occupavano gran parte della RAM, hanno bloccato il PC per memoria esaurita. Per questo, quando fanno parte dei test selezionati:
+
+- all'avvio compare l'avviso *"i test che verranno eseguiti richiedono parecchia memoria…"*;
+- pytest controlla la RAM disponibile e, se è **sotto i 2 GB**, si ferma **prima** di caricare i modelli, spiegando cosa fare.
+
+Quelli su ONNX vengono saltati finché il modello non è esportato.
 
 ```bash
 cd backend
-.venv/bin/python -m pytest                                      # tutta la suite (~30 s)
-.venv/bin/python -m pytest -m "not model"                       # senza il modello vero
-.venv/bin/python -m pytest --cov=app --cov-report=term-missing  # con copertura
+.venv/bin/python -m pytest                                      # tutta la suite, con avviso e controllo della memoria (~1 min)
+.venv/bin/python -m pytest -m "not model"                       # solo i test leggeri, senza modelli veri (~20 s)
+.venv/bin/python -m pytest --cov=app --cov=desktop --cov-report=term-missing  # con copertura
 ```
 
 Nessun test chiama servizi esterni: i provider AI sono testati con un trasporto HTTP simulato.

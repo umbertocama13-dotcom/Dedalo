@@ -4,7 +4,7 @@ Questo documento raccoglie **perché** il PoC è fatto così: decisioni di desig
 
 Per installazione, avvio e uso vedi il [README.md](README.md).
 
-Stato al 15/09/2026: **v2 completa** e **app desktop per Windows pronta per la build**. Backend testato su MySQL e SQLite (604 test, compresi quelli con i modelli veri), launcher verificato su Linux con il modello ONNX e il server reale. L'installer Windows non è ancora stato costruito e provato su Windows. La modalità LLM è testata solo con provider simulati.
+Stato al 16/09/2026: **v2 completa** e **app desktop per Windows costruita**. Backend testato su MySQL e SQLite (604 test, compresi quelli con i modelli veri), launcher verificato su Linux con il modello ONNX e il server reale, `Dedalo-Setup.exe` prodotto da `build.ps1` su una VM Windows 10 (le tre correzioni emerse in quella build sono nella sezione D4). Restano da percorrere la checklist dell'app installata e la prova della modalità LLM, testata finora solo con provider simulati.
 
 ---
 
@@ -63,6 +63,10 @@ Lo sviluppo non è cambiato: il desktop è una **seconda configurazione** dello 
   - `SET NAMES utf8mb4` tolto dai seed (non valido in SQLite): la connessione dei test imposta già il charset e il README usa `--default-character-set=utf8mb4`.
 - **Seed diviso**: `seed_catalog.sql` (famiglie e fasi, usato anche dal desktop) e `seed.sql` (utenti demo e diagnosi, solo sviluppo). Le diagnosi di esempio del desktop arrivano da `sample_diagnostics.csv`, generato dal seed; un test verifica che coincidano.
 - **Test su entrambi i database**: la fixture `settings` è parametrizzata, quindi ogni test d'integrazione gira su MySQL e su SQLite.
+- **Controllo della memoria prima dei test dei modelli veri** (`tests/memory_guard.py`, collegato in `conftest.py`): quei test tengono in memoria insieme il modello PyTorch e quello ONNX, con un picco misurato di circa 1,5 GB. Durante lo sviluppo, eseguiti in parallelo ad altri lavori pesanti (pacchetto PyInstaller avviato, build del frontend, VM Windows da 6,8 GB) hanno esaurito gli 11 GB di RAM del PC, che si è bloccato due volte: i log mostrano *memory pressure* e rallentamenti, poi lo spegnimento forzato. Ora, quando sono selezionati, pytest mostra un avviso e si ferma prima di caricare i modelli se `MemAvailable` è sotto i 2 GB.
+  - *Scartato: escludere quei test di default* (`addopts = -m "not model"`). È stato provato, ma rende facile dimenticarli, mentre devono girare sempre.
+  - *Scartato: un popup o una conferma "premi Invio"*. pytest gira anche senza interfaccia grafica e non legge la tastiera durante i test: l'esecuzione resterebbe bloccata.
+  - *Scartato: caricare un modello alla volta nei test*. Complica il codice e non risolve il problema di fondo, cioè i lavori pesanti in parallelo.
 
 *Scartato: MySQL installato sul PC.* Non sarebbe stato "clicca e parte".
 *Scartato per ora: server centrale + client.* È la strada per una knowledge base condivisa, ma richiede un server sempre acceso in rete.
@@ -120,6 +124,9 @@ Un eseguibile unico (onefile) dovrebbe estrarre centinaia di MB in una cartella 
 | `SET NAMES utf8mb4` nei seed condivisi | sintassi solo MySQL, SQLite la rifiuta | tolto dai seed; charset impostato dalla connessione e dal comando `mysql` |
 | SQLite in modalità WAL (più letture durante una scrittura) | provando il pacchetto: alla chiusura le ultime modifiche restavano in `dedalo.db-wal`, e una copia del solo `dedalo.db` conteneva 0 utenti e 0 diagnosi. Il backup indicato nella documentazione avrebbe perso tutto | `journal_mode=DELETE` (il default di SQLite): ogni scrittura confermata finisce subito in `dedalo.db`. Con un solo utente WAL non serviva; test di regressione sulla copia del file |
 | Prova del pacchetto che attendeva la riga con l'indirizzo | la `print` del launcher non svuotava il buffer: con l'output in pipe la riga non arrivava mai e la prova andava in timeout | `flush=True` sulle `print` del launcher |
+| `build.ps1` alla prima build vera su Windows | errore di analisi: in `"... not found in $InnoCompiler: see BUILD.md"` PowerShell legge `$InnoCompiler:` come nome di un'unità, e lo script non parte nemmeno | messaggio riscritto senza quel costrutto. Regola: dentro una stringa, una variabile seguita da `:` va scritta `${Nome}` |
+| Percorso fisso di `ISCC.exe` in `Program Files (x86)` | `winget` senza privilegi di amministratore installa Inno Setup in `%LocalAppData%\Programs`: lo script diceva "non trovato" anche con Inno Setup installato | ricerca nei tre percorsi possibili, con errore che li elenca tutti |
+| Export ONNX su una Windows appena installata | `OSError [WinError 126] ... c10.dll`: mancava il Visual C++ Redistributable x64, richiesto dalle librerie native di PyTorch. Si scopriva dopo ~1 GB di download | controllo del registro **prima** di scaricare PyTorch, con il comando `winget` nell'errore; redistributable aggiunto ai requisiti di `BUILD.md` |
 
 ## D5. Limiti conosciuti
 
@@ -127,7 +134,7 @@ Un eseguibile unico (onefile) dovrebbe estrarre centinaia di MB in una cartella 
 2. **Famiglie e fasi** sono quelle del catalogo di esempio: non si gestiscono dall'interfaccia né dal CSV.
 3. **Utenti**: si possono solo creare. Niente modifica del ruolo, disattivazione o reset della password da interfaccia; una password dimenticata dell'unico esperto non si recupera.
 4. **Eseguibile non firmato**: SmartScreen mostra un avviso al primo avvio, e alcuni antivirus segnalano i pacchetti PyInstaller come falsi positivi.
-5. **Installer non ancora provato su Windows reale**: spec, launcher e server sono verificati su Linux, ma finestra WebView2, download e installer vanno controllati sulla VM (checklist in `packaging/windows/BUILD.md`).
+5. **Build verificata su Windows, app installata ancora da collaudare**: `build.ps1` produce `Dedalo-Setup.exe` su una VM Windows 10 (dopo le tre correzioni della sezione D4), ma finestra WebView2, download dei CSV, icona sul desktop e disinstallazione vanno percorsi con la checklist di `packaging/windows/BUILD.md`.
 6. **Primo avvio in contemporanea**: due richieste di setup nello stesso istante potrebbero creare due esperti. Su un PC singolo c'è una sola schermata aperta.
 7. **SQLite**: `NOCASE` ignora maiuscole e minuscole solo per le lettere senza accento.
 8. **Porta locale**: mentre l'app è aperta, un altro utente dello stesso PC potrebbe raggiungere il server (serve comunque il login).

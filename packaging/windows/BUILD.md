@@ -22,7 +22,10 @@ winget install --id Python.Python.3.12 -e --source winget
 winget install --id OpenJS.NodeJS.LTS -e --source winget
 winget install --id JRSoftware.InnoSetup -e --source winget
 winget install --id Git.Git -e --source winget
+winget install --id Microsoft.VCRedist.2015+.x64 -e --source winget
 ```
+
+L'ultimo, il *Visual C++ Redistributable*, serve a PyTorch durante l'export del modello: senza, la build si ferma perché non riesce a caricare le sue librerie (`c10.dll`).
 
 Se `winget` non esiste, aggiorna *App Installer* dal Microsoft Store e riprova.
 
@@ -32,10 +35,10 @@ Se `winget` non esiste, aggiorna *App Installer* dal Microsoft Store e riprova.
 py -3.12 --version
 node --version
 git --version
-Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "${env:ProgramFiles}\Inno Setup 6\ISCC.exe", "$env:LocalAppData\Programs\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
 ```
 
-Devi vedere Python 3.12.x, Node v22 o superiore, una versione di Git e `True`.
+Devi vedere Python 3.12.x, Node v22 o superiore, una versione di Git e il percorso di `ISCC.exe`. L'ultimo comando controlla tutte le cartelle in cui `winget` può installare Inno Setup: senza privilegi di amministratore finisce nella cartella dell'utente, e va bene lo stesso. Se non stampa nulla, Inno Setup non è installato: ripeti il suo comando `winget`.
 
 ## 2. Scaricare il progetto
 
@@ -131,7 +134,8 @@ Installare la nuova versione sopra la vecchia la aggiorna: i dati restano.
 |---|---|
 | `build.ps1 cannot be loaded because running scripts is disabled` | usa il comando con `-ExecutionPolicy Bypass` come sopra |
 | `py not found` o `npm not found` | chiudi e riapri PowerShell dopo le installazioni del passo 1 |
-| `Inno Setup 6 not found` | ripeti `winget install --id JRSoftware.InnoSetup -e` |
+| `Inno Setup 6 not found` | l'errore elenca le cartelle controllate; se compare, Inno Setup non è installato davvero: ripeti `winget install --id JRSoftware.InnoSetup -e` |
+| `Visual C++ Redistributable x64 is missing`, oppure `WinError 126` / `c10.dll` | installa il redistributable: `winget install --id Microsoft.VCRedist.2015+.x64 -e`, poi chiudi e riapri PowerShell |
 | La build si ferma su `pip install` | problema di rete o proxy aziendale: riprova, oppure configura il proxy di pip |
 | Finestra di Dedalo bianca o che non si apre | manca WebView2: installa *Microsoft Edge WebView2 Runtime* dal sito Microsoft e riprova; dettagli nel log |
 | *"Dedalo non si è avviato"* nella finestra | leggi il motivo e il log (passo 5) |

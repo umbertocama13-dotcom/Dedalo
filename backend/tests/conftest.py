@@ -26,12 +26,31 @@ from app.db_init import run_sqlite_scripts
 from app.main import create_app
 from app.services.security import create_access_token
 from tests.fake_embedder import FakeEmbedder
+from tests.memory_guard import MEMORY_WARNING, available_memory_mb, low_memory_message
 
 DATABASE_DIR = Path(__file__).resolve().parents[2] / "database"
 SEED_SCRIPTS = ("seed_catalog.sql", "seed.sql")
 
 EXPERT_ID = 1
 OPERATOR_ID = 2
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Warns before the real-model tests and stops if the available RAM is not enough.
+
+    Runs after -m/-k filters are applied, so it acts only when model tests are really selected.
+    """
+    if not any(item.get_closest_marker("model") for item in session.items):
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(MEMORY_WARNING, yellow=True, bold=True)
+    # --collect-only runs no test: nothing is loaded, so there is nothing to protect.
+    if session.config.option.collectonly:
+        return
+    problem = low_memory_message(available_memory_mb())
+    if problem:
+        pytest.exit(problem, returncode=pytest.ExitCode.INTERRUPTED)
 
 
 def _rebuild_mysql_test_database(settings: Settings) -> None:

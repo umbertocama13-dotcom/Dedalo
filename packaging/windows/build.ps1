@@ -23,7 +23,13 @@ $Root = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $Packaging = $PSScriptRoot
 $Build = Join-Path $Packaging "build"
 $ModelDir = Join-Path $Root "backend\models\sentence-bert-base-italian-xxl-uncased"
-$InnoCompiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+# winget installs Inno Setup under Program Files with administrator rights and in the user's
+# own folder without them, so the compiler is looked up in every place it can end up.
+$InnoCompilerCandidates = @(
+    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+    "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
+    "${env:LocalAppData}\Programs\Inno Setup 6\ISCC.exe"
+)
 $WebView2Bootstrapper = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 
 # PowerShell does not stop on a failing external program: check every exit code explicitly.
@@ -43,17 +49,39 @@ function New-Venv {
     return (Join-Path $Path "Scripts\python.exe")
 }
 
+function Test-VisualCppRuntime {
+    # Registry value written by the Visual C++ Redistributable x64 installer.
+    foreach ($key in @(
+        "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
+    )) {
+        $runtime = Get-ItemProperty -Path $key -Name "Installed" -ErrorAction SilentlyContinue
+        if ($runtime -and $runtime.Installed -eq 1) { return $true }
+    }
+    return $false
+}
+
 Write-Host "Dedalo $Version - build in $Root"
 foreach ($tool in @("py", "npm")) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool not found: see BUILD.md" }
 }
-if (-not (Test-Path $InnoCompiler)) { throw "Inno Setup 6 not found in $InnoCompiler: see BUILD.md" }
+$InnoCompiler = $InnoCompilerCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $InnoCompiler) {
+    throw ("Inno Setup 6 not found. Checked:`n  {0}`nInstall it with: winget install --id JRSoftware.InnoSetup -e" -f ($InnoCompilerCandidates -join "`n  "))
+}
+Write-Host "Inno Setup compiler: $InnoCompiler"
 New-Item -ItemType Directory -Force $Build | Out-Null
 
 # 1. Embedding model -> ONNX, in a separate environment (needs PyTorch, which the app does not ship).
 if ($SkipModelExport -and (Test-Path (Join-Path $ModelDir "model.onnx"))) {
     Write-Host "`n=== Model export skipped: using $ModelDir" -ForegroundColor Cyan
 } else {
+    # PyTorch's native libraries need the Visual C++ runtime. Checked here and not later,
+    # because otherwise the failure ("WinError 126 ... c10.dll") arrives only after
+    # downloading about 1 GB of PyTorch.
+    if (-not (Test-VisualCppRuntime)) {
+        throw "Microsoft Visual C++ Redistributable x64 is missing, and PyTorch needs it to export the model. Install it with: winget install --id Microsoft.VCRedist.2015+.x64 -e"
+    }
     $ExportPython = New-Venv (Join-Path $Build "venv-export")
     Invoke-Step "Update pip (export environment)" { & $ExportPython -m pip install --upgrade pip }
     Invoke-Step "Install PyTorch CPU (export only)" {
