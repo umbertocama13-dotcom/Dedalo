@@ -8,11 +8,42 @@ Cause e soluzioni vengono **sempre dalla knowledge base**, mai generate. Se null
 
 > 📐 Decisioni di design, calibrazione, alternative scartate e limiti conosciuti sono in **[workflow_sviluppo.md](workflow_sviluppo.md)**. Questo README spiega come installare, avviare e usare il progetto.
 
+> 🖥️ **Vuoi solo provare la demo su Windows?** Non serve installare nulla: vai nella sezione **[Releases](../../releases)** del repository, apri l'ultima release e scarica `Dedalo-Setup.exe` dagli *Assets*. Doppio clic sull'installer, poi sull'icona **Dedalo** creata sul desktop. Dettagli nella sezione [App desktop per Windows](#app-desktop-per-windows).
+
+## Perché Dedalo
+
+### Il problema
+
+Le linee e le celle produttive ad alta complessità meccatronica non hanno quasi mai un manuale che spiega il funzionamento dell'intero impianto. I fornitori consegnano i manuali dei singoli componenti, più un manualetto generico scritto per le certificazioni di sicurezza: la conoscenza di come i pezzi lavorano *insieme*, e di cosa fare quando qualcosa si rompe, resta nella testa di poche persone.
+
+Quando il guasto è complesso, o richiede di incrociare più variabili, la produzione si ferma finché non interviene un tecnico esperto — che è spesso impegnato altrove, e nel frattempo la linea resta ferma.
+
+### Cosa cambia con Dedalo
+
+Dedalo trasforma la conoscenza degli esperti in una knowledge base consultabile in linguaggio naturale, sempre disponibile all'operatore:
+
+- **l'operatore ha una guida esperta sempre al suo fianco**, anche fuori dagli orari in cui l'esperto è raggiungibile;
+- **il MTTD (mean time to detect) si riduce**: la diagnosi è a portata di chat, e l'operatore risolve da solo la maggior parte dei casi senza aspettare nessuno;
+- **l'esperto viene interpellato solo quando serve davvero**, e può concentrarsi sui problemi nuovi invece di rispiegare gli stessi guasti ricorrenti.
+
+### Come entra l'AI
+
+La ricerca del sintomo giusto è **sempre semantica e deterministica**: un modello di embedding locale confronta il significato di quello che scrive l'operatore con i sintomi registrati, senza bisogno di un LLM e senza inviare nulla fuori dalla macchina. Causa e soluzione mostrate arrivano **sempre e solo dalla knowledge base**: nessun testo viene mai generato.
+
+Un LLM, facoltativo (vedi [Assistente AI](#assistente-ai-opzionale)), può aggiungersi sopra questo motore per rendere la conversazione più naturale: fa domande per restringere le ipotesi quando sono vicine tra loro, ma non decide mai da solo la diagnosi finale, e ogni sua risposta viene validata prima di essere mostrata. Spento, l'app resta comunque completa, offline e gratuita.
+
+### Visione
+
+Oggi ogni installazione di Dedalo ha una knowledge base separata, popolata da un solo esperto per volta. Il passo naturale successivo è una knowledge base condivisa tra più linee e stabilimenti, che cresce mano a mano che gli esperti la usano e la correggono — così l'AI ha sempre più contesto reale su cui basarsi, e ogni guasto risolto una volta diventa disponibile per tutti gli operatori, ovunque si ripresenti.
+
+Le tappe tecniche già individuate per arrivarci sono in **[workflow_sviluppo.md](workflow_sviluppo.md)** (sezioni *Migliorie possibili*).
+
 ---
 
 ## Indice
 
 - [Funzionalità](#funzionalità)
+- [Perché Dedalo](#perché-dedalo)
 - [Stack](#stack)
 - [Struttura del progetto](#struttura-del-progetto)
 - [Requisiti](#requisiti)
@@ -302,6 +333,8 @@ Le prime tre righe creano diagnosi con i tre ambiti (generica, famiglia, fase). 
 ## App desktop per Windows
 
 Dedalo esiste anche come **app desktop per un singolo PC**: un installer `Dedalo-Setup.exe` crea l'icona sul desktop, e con un doppio clic si apre una finestra con l'app completa. Non servono MySQL, Python né Node sul PC dell'utente.
+
+**Per provarla senza compilare nulla**: scarica l'installer già pronto dalla sezione **[Releases](../../releases)** del repository (asset `Dedalo-Setup.exe` dell'ultima release), ed esegui la procedura descritta in [Primo avvio](#primo-avvio) più sotto.
 
 | | Sviluppo / server | App desktop |
 |---|---|---|
